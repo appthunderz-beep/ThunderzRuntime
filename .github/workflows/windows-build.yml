@@ -1,0 +1,29 @@
+name: Build Thunderz Runtime (Windows x64)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild tools
+        uses: microsoft/setup-msbuild@v1
+
+      - name: Compile ThunderzRuntime.cpp (x64)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
+          if not exist build mkdir build
+          cl /EHsc /MD ThunderzRuntime.cpp /link /MACHINE:X64 gdiplus.lib user32.lib gdi32.lib kernel32.lib /OUT:build\ThunderzRuntime.exe
+
+      - name: Package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderz-windows-x64
+          path: build\ThunderzRuntime.exe
