@@ -10,41 +10,40 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Setup MSYS2 (MINGW64)
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: MINGW64
-        update: true
-        install: |
-          mingw-w64-x86_64-toolchain
-          mingw-w64-x86_64-gcc
+      - name: Setup MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: |
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-gcc
 
-     - name: Compile Runtime and Editor
-      shell: bash -l {0}
-      run: |
-        set -e
-        export PATH="/c/msys64/mingw64/bin:$PATH"
-        mkdir -p build
-        echo "g++ version:"
-        g++ --version
+      - name: Compile Runtime and Editor
+        shell: bash -l {0}
+        run: |
+          set -e
+          export PATH="/c/msys64/mingw64/bin:$PATH"
+          mkdir -p build
+          echo "g++ version:"
+          g++ --version
 
-        # compile runtime (needs C++17 for filesystem)
-        g++ -static -O2 -std=gnu++17 ThunderzRuntime.cpp -o build/ThunderzRuntime.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
+          # compile runtime (needs C++17 for filesystem)
+          g++ -static -O2 -std=gnu++17 ThunderzRuntime.cpp -o build/ThunderzRuntime.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
 
-        # compile editor (also uses filesystem + thumbnails)
-        g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
+          # compile editor (also uses filesystem + thumbnails)
+          g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
 
-        ls -lh build/
+          ls -lh build/
 
-
-    - name: Upload artifact (runtime + editor)
-      uses: actions/upload-artifact@v4
-      with:
-        name: thunderz-tools-x64
-        path: build/
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderz-tools-x64
+          path: build/
 
 
 
