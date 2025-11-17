@@ -195,7 +195,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (assetImages[i]) {
                 // fit thumbnail preserving ratio
                 int iw = assetImages[i]->GetWidth(), ih = assetImages[i]->GetHeight();
-                float scale = min( (float)dst.Width/iw, (float)dst.Height/ih );
+                float scale = std::min( (float)dst.Width/iw, (float)dst.Height/ih );
                 int dw = (int)(iw*scale), dh = (int)(ih*scale);
                 int dx = dst.GetLeft() + (dst.Width-dw)/2, dy = dst.GetTop() + (dst.Height-dh)/2;
                 g.DrawImage(assetImages[i], dx, dy, dw, dh);
