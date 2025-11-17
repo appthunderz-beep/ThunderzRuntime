@@ -1,4 +1,4 @@
-name: Build Thunderz Runtime (Windows x64)
+name: Build Thunderz Tools (Windows x64)
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Install MSYS2
+    - name: Setup MSYS2 (MINGW64)
       uses: msys2/setup-msys2@v2
       with:
         msystem: MINGW64
@@ -22,23 +22,26 @@ jobs:
           mingw-w64-x86_64-toolchain
           mingw-w64-x86_64-gcc
 
-    - name: Compile ThunderzRuntime.cpp
+    - name: Compile Runtime and Editor
       shell: bash -l {0}
       run: |
         set -e
         export PATH="/c/msys64/mingw64/bin:$PATH"
         mkdir -p build
-        echo "Using GCC:"
+        echo "g++ version:"
         g++ --version
-        # BUILD (final working command with unicode support)
+        # compile runtime (wWinMain uses -municode)
         g++ -static -O2 ThunderzRuntime.cpp -o build/ThunderzRuntime.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
+        # compile editor
+        g++ -static -O2 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
         ls -lh build/
 
-    - name: Upload artifact
+    - name: Upload artifact (runtime + editor)
       uses: actions/upload-artifact@v4
       with:
-        name: thunderz-windows-x64
-        path: build/ThunderzRuntime.exe
+        name: thunderz-tools-x64
+        path: build/
+
 
 
 
