@@ -8,37 +8,37 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    - name: Checkout repo
+      uses: actions/checkout@v4
 
-      - name: Setup MSYS2 (MINGW64)
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-gcc
-        # run the shell steps in bash -l so MSYS environment loads
+    - name: Install MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: |
+          mingw-w64-x86_64-toolchain
+          mingw-w64-x86_64-gcc
 
-      - name: Compile with mingw (x64)
-        shell: bash -l {0}
-        run: |
-          set -e
-          mkdir -p build
-          # ensure the MinGW64 bin is available in PATH
-          export PATH="/c/msys64/mingw64/bin:$PATH"
-          echo "GCC version:"
-          x86_64-w64-mingw32-g++ --version || g++ --version
-          # compile the runtime
-          x86_64-w64-mingw32-g++ -static -O2 ThunderzRuntime.cpp -o build/ThunderzRuntime.exe -lgdiplus -lgdi32 -luser32 -lkernel32
-          ls -lh build/
+    - name: Compile ThunderzRuntime.cpp
+      shell: bash -l {0}
+      run: |
+        set -e
+        export PATH="/c/msys64/mingw64/bin:$PATH"
+        mkdir -p build
+        echo "Using GCC:"
+        g++ --version
+        # BUILD (final working command with unicode support)
+        g++ -static -O2 ThunderzRuntime.cpp -o build/ThunderzRuntime.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
+        ls -lh build/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: thunderz-windows-x64
-          path: build/ThunderzRuntime.exe
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: thunderz-windows-x64
+        path: build/ThunderzRuntime.exe
+
 
 
