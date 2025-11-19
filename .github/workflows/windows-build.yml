@@ -23,7 +23,7 @@ jobs:
             mingw-w64-x86_64-gcc
 
       - name: Compile Runtime and Editor
-        shell: bash -l {0}
+        shell: 'bash -l {0}'
         run: |
           set -e
           export PATH="/c/msys64/mingw64/bin:$PATH"
