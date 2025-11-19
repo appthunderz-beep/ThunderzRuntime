@@ -19,8 +19,10 @@
 #include <codecvt>
 #include <locale>
 #include <ctime>
+#include <algorithm> // <--- FIX: needed for std::sort
+#include <cstdlib>
 
-#pragma comment(lib, "shlwapi.lib") // for PathFileExistsW if using MSVC; MinGW may ignore pragma
+#pragma comment(lib, "shlwapi.lib") // ignored by MinGW but harmless
 
 using namespace Gdiplus;
 
@@ -121,7 +123,6 @@ static std::wstring GetExeFolderW()
     DWORD len = GetModuleFileNameW(NULL, buf, MAX_PATH);
     if (len == 0 || len == MAX_PATH) return L".";
     std::wstring p(buf, buf + len);
-    // remove exe filename -> folder
     size_t pos = p.find_last_of(L"\\/");
     if (pos != std::wstring::npos) p = p.substr(0, pos);
     return p;
@@ -129,7 +130,6 @@ static std::wstring GetExeFolderW()
 
 static bool ReadConfigAndResolveProject()
 {
-    // config path: EXE_FOLDER\config.txt
     std::wstring cfg = g_exeFolder + L"\\config.txt";
     std::string content;
     if (!ReadFileAsUtf8(cfg, content)) {
@@ -138,16 +138,12 @@ static bool ReadConfigAndResolveProject()
     }
     AppendLog("Read config content (first 1024 bytes): " + content.substr(0, std::min<size_t>(content.size(), 1024)));
 
-    // naive parse: find line starting with project_path=
     std::istringstream iss(content);
     std::string line;
     while (std::getline(iss, line)) {
-        // trim spaces
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line.find("project_path=") == 0) {
             std::string val = line.substr(strlen("project_path="));
-            // convert to wstring. The config likely contains backslashes single backslash.
-            // handle both forward and back slashes. We assume path in config is a normal Windows path.
             g_projectPath = Utf8ToWString(val);
             AppendLog("Resolved project path (from config): " + WStringToUtf8(g_projectPath));
             return true;
@@ -163,7 +159,6 @@ static void ScanAssetsFolder()
     std::wstring assetsDir = g_projectPath + L"\\assets";
     AppendLog("Scanning assets in: " + WStringToUtf8(assetsDir));
 
-    // Use Win32 FindFirstFileW to enumerate
     std::wstring search = assetsDir + L"\\*.*";
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(search.c_str(), &fd);
@@ -184,7 +179,6 @@ static void ScanAssetsFolder()
     FindClose(h);
 }
 
-// Find Asset by filename (case-sensitive)
 static Asset* FindAssetByName(const std::wstring &name)
 {
     for (auto &a : g_assets) {
@@ -194,25 +188,9 @@ static Asset* FindAssetByName(const std::wstring &name)
 }
 
 // -------------------- Scene parser (naive, tuned to your format) --------------------
-// Expects scene like:
-// {
-//  "id":"main",
-//  "entities":[
-//    { "id":"bg",   "asset":"bg.bmp",   "x":0,   "y":0,   "z":0 },
-//    { "id":"hero", "asset":"hero.bmp", "x":300, "y":350, "z":1 }
-//  ],
-//  "script":[]
-// }
-
-static std::string SkipSpacesAnd(const std::string &s, size_t &i)
-{
-    while (i < s.size() && isspace((unsigned char)s[i])) ++i;
-    return "";
-}
 
 static std::string ExtractStringValue(const std::string &s, size_t &i)
 {
-    // i should point to opening quote or whitespace before it
     while (i < s.size() && s[i] != '"') ++i;
     if (i >= s.size() || s[i] != '"') return {};
     ++i;
@@ -230,7 +208,6 @@ static std::string ExtractStringValue(const std::string &s, size_t &i)
 
 static int ExtractIntValue(const std::string &s, size_t &i)
 {
-    // find next digit or '-' sign
     while (i < s.size() && !((s[i] >= '0' && s[i] <= '9') || s[i] == '-')) ++i;
     if (i >= s.size()) return 0;
     int sign = 1;
@@ -255,49 +232,39 @@ static void LoadSceneEntities()
     }
     AppendLog("Scene file content (first 1024 bytes):\n" + content.substr(0, std::min<size_t>(content.size(), 1024)));
 
-    // naive search for entity objects
     size_t pos = 0;
     while (true) {
-        // find next '{' that starts an entity object inside entities array
         size_t objStart = content.find('{', pos);
         if (objStart == std::string::npos) break;
         size_t objEnd = content.find('}', objStart);
         if (objEnd == std::string::npos) break;
         std::string block = content.substr(objStart, objEnd - objStart + 1);
 
-        // check if this block contains "asset"
         if (block.find("\"asset\"") != std::string::npos) {
             Entity e;
-            // parse id
             size_t idx = 0;
-            // find "id":
             size_t pid = block.find("\"id\"", idx);
             if (pid != std::string::npos) {
                 idx = pid;
-                std::string key = ExtractStringValue(block, idx); // will find the first quote - not ideal for keys, but tuned
-                // After extracting "id" key it leaves idx at next char after closing quote. We need to find next quoted value.
-                // Find next quote for value:
+                std::string key = ExtractStringValue(block, idx);
                 size_t q = block.find('"', idx);
                 if (q != std::string::npos) {
                     idx = q;
                     e.id = ExtractStringValue(block, idx);
                 }
             }
-            // parse asset
             size_t passet = block.find("\"asset\"", 0);
             if (passet != std::string::npos) {
                 size_t idx2 = passet;
-                std::string k = ExtractStringValue(block, idx2); // gets "asset" key unexpectedly but we then find next quoted value
+                std::string k = ExtractStringValue(block, idx2);
                 size_t q = block.find('"', idx2);
                 if (q != std::string::npos) { idx2 = q; std::string assetName = ExtractStringValue(block, idx2);
                     e.asset = Utf8ToWString(assetName);
                 }
             }
-            // parse x,y,z
             size_t px = block.find("\"x\"", 0);
             if (px != std::string::npos) {
                 size_t i = px;
-                // find colon
                 size_t colon = block.find(':', i);
                 if (colon != std::string::npos) { i = colon+1; e.x = ExtractIntValue(block, i); }
             }
@@ -313,16 +280,12 @@ static void LoadSceneEntities()
                 size_t colon = block.find(':', i);
                 if (colon != std::string::npos) { i = colon+1; e.z = ExtractIntValue(block, i); }
             }
-
-            // push entity
             g_entities.push_back(e);
         }
-
         pos = objEnd + 1;
     }
 
     AppendLog("Loaded entities count: " + std::to_string(g_entities.size()));
-    // now attach asset pointers if available
     for (auto &ent : g_entities) {
         Asset *a = FindAssetByName(ent.asset);
         if (a) ent.assetPtr = a;
@@ -335,14 +298,11 @@ static void LoadSceneEntities()
 static void LoadBitmaps()
 {
     for (auto &a : g_assets) {
-        // use Gdiplus::Bitmap::FromFile which accepts wide LPCWSTR. Use a.fullPath.
         std::wstring full = a.fullPath;
-        // If file doesn't exist or not BMP, skip
         if (!FileExistsW(full)) {
             AppendLog("Asset file missing: " + WStringToUtf8(full));
             continue;
         }
-        // Load via GDI+
         Bitmap *bmp = Bitmap::FromFile(full.c_str(), false);
         if (!bmp) {
             AppendLog("GDI+: failed to create bitmap for: " + WStringToUtf8(full));
@@ -366,18 +326,14 @@ static void LoadBitmaps()
 static void PaintScene(HDC hdc)
 {
     Graphics g(hdc);
-    // background fill - light blue
-    SolidBrush bgBrush(Color(255, 108, 139, 182)); // muted blue
+    SolidBrush bgBrush(Color(255, 108, 139, 182));
     g.FillRectangle(&bgBrush, 0, 0, (INT)g_windowW, (INT)g_windowH);
 
-    // Draw grid in scene area (left portion). We'll draw full window grid for simplicity
     Pen gridPen(Color(80, 40, 40, 40));
     int cell = 40;
     for (int x = 0; x < (int)g_windowW; x += cell) g.DrawLine(&gridPen, REAL(x), 0.0f, REAL(x), (REAL)g_windowH);
     for (int y = 0; y < (int)g_windowH; y += cell) g.DrawLine(&gridPen, 0.0f, REAL(y), (REAL)g_windowW, REAL(y));
 
-    // draw entities in order by z (lower z first)
-    // simple sort copy
     std::vector<Entity*> order;
     for (auto &e : g_entities) order.push_back(&e);
     std::sort(order.begin(), order.end(), [](Entity *a, Entity *b){ return a->z < b->z; });
@@ -389,10 +345,8 @@ static void PaintScene(HDC hdc)
             UINT bh = bmp->GetHeight();
             REAL destX = (REAL)p->x;
             REAL destY = (REAL)p->y;
-            // draw the bitmap at pos
             g.DrawImage(bmp, destX, destY, (REAL)bw, (REAL)bh);
         } else {
-            // draw a placeholder box with the entity id
             SolidBrush red(Color(255, 200, 80, 80));
             FontFamily ff(L"Segoe UI");
             Font font(&ff, 18.0f, FontStyleRegular, UnitPixel);
@@ -450,36 +404,29 @@ static bool InitGDIPlus()
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 {
-    // initialize empty log
-    {
-        std::ofstream f("runtime.log", std::ios::trunc);
-        f << CurrentTimestamp() << " - --- Thunderz Runtime (debug) startup ---\n";
-    }
+    std::ofstream f("runtime.log", std::ios::trunc);
+    f << CurrentTimestamp() << " - --- Thunderz Runtime (debug) startup ---\n";
+    f.close();
 
     g_exeFolder = GetExeFolderW();
     AppendLog("EXE folder: " + WStringToUtf8(g_exeFolder));
 
-    // Read config
     if (!ReadConfigAndResolveProject()) {
         AppendLog("FATAL: Could not resolve project path. Exiting.");
         MessageBoxW(NULL, L"Could not read config.txt or project_path missing. See runtime.log", L"Error", MB_ICONERROR);
         return 1;
     }
 
-    // scan assets and load scene
     ScanAssetsFolder();
     LoadSceneEntities();
 
-    // init GDI+
     if (!InitGDIPlus()) {
         MessageBoxW(NULL, L"GDI+ init failed. See runtime.log", L"Error", MB_ICONERROR);
         return 1;
     }
 
-    // load bitmaps now that GDI+ is init
     LoadBitmaps();
 
-    // register window class
     const wchar_t CLASS_NAME[] = L"ThunderzRuntimeWindow";
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
@@ -490,7 +437,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 
     RegisterClassW(&wc);
 
-    // create window
     int winW = 1280, winH = 720;
     g_windowW = winW; g_windowH = winH;
     HWND hwnd = CreateWindowExW(
@@ -512,14 +458,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // main message loop
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    // cleanup GDI+
     for (auto &a : g_assets) {
         if (a.bmp) {
             delete a.bmp;
@@ -535,4 +479,3 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
     AppendLog("Runtime exiting normally");
     return 0;
 }
-
