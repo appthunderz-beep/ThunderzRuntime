@@ -171,8 +171,8 @@ void LoadScene() {
     while (true) {
         pos = raw.find("\"asset\"", pos);
         if (pos == std::string::npos) break;
-        size_t q1 = raw.find('"', raw.find(':', pos) + 1);
-        size_t q2 = raw.find('"', q1 + 1);
+        size_t q1 = raw.find('\"', raw.find(':', pos) + 1);
+        size_t q2 = raw.find('\"', q1 + 1);
         if (q1 == std::string::npos || q2 == std::string::npos) break;
         std::string asset = raw.substr(q1 + 1, q2 - q1 - 1);
         size_t xPos = raw.find("\"x\"", pos);
@@ -380,24 +380,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         std::string narrow = ws_to_s(cfgLine);
         std::transform(narrow.begin(), narrow.end(), narrow.begin(), ::tolower);
         size_t pos = narrow.find("project_path=");
-        std::wstring rel;
         if (pos != std::string::npos) {
-            std::string val = cfgLine.substr((int)pos + 13); // after project_path=
-            // trim
-            while (!val.empty() && (val.back()=='\r' || val.back()=='\n')) val.pop_back();
-            // if absolute (contains : or starting slash), use as-is, else relative to exe
-            bool isAbs = (val.find(':')!=std::string::npos) || (val.size()>0 && (val[0]=='\\' || val[0]=='/'));
-            if (isAbs) projectPath = s_to_ws(val);
-            else projectPath = exeFolder + L"\\" + s_to_ws(val);
+            // extract from wide string using the same index
+            std::wstring val_w = cfgLine.substr((int)pos + 13); // after project_path=
+            // trim CR/LF from wide string
+            while (!val_w.empty() && (val_w.back() == L'\r' || val_w.back() == L'\n')) val_w.pop_back();
+            std::string val = ws_to_s(val_w);
+            // detect absolute path by checking for drive letter or starting slash
+            bool isAbs = (val.find(':') != std::string::npos) || (!val.empty() && (val[0] == '\\' || val[0] == '/'));
+            if (isAbs) projectPath = val_w;
+            else projectPath = exeFolder + L"\\" + val_w;
         } else {
             // try simpler key
             pos = narrow.find("project=");
             if (pos != std::string::npos) {
-                std::string val = cfgLine.substr((int)pos + 8);
-                while (!val.empty() && (val.back()=='\r' || val.back()=='\n')) val.pop_back();
-                bool isAbs = (val.find(':')!=std::string::npos) || (val.size()>0 && (val[0]=='\\' || val[0]=='/'));
-                if (isAbs) projectPath = s_to_ws(val);
-                else projectPath = exeFolder + L"\\" + s_to_ws(val);
+                std::wstring val_w = cfgLine.substr((int)pos + 8);
+                while (!val_w.empty() && (val_w.back() == L'\r' || val_w.back() == L'\n')) val_w.pop_back();
+                std::string val = ws_to_s(val_w);
+                bool isAbs = (val.find(':') != std::string::npos) || (!val.empty() && (val[0] == '\\' || val[0] == '/'));
+                if (isAbs) projectPath = val_w;
+                else projectPath = exeFolder + L"\\" + val_w;
             }
         }
     }
@@ -467,3 +469,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     gLog.close();
     return 0;
 }
+
