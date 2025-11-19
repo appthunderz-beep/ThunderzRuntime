@@ -1,4 +1,4 @@
-// ThunderzEditor_debug.cpp - Debug build (keeps all features + detailed logging)
+// ThunderzEditor_debug_patched.cpp - Debug build (GDI+ startup moved before bitmap loads)
 // Replace your ThunderzEditor.cpp with this file. It will create `editor.log` next to the EXE
 // and print exactly what it reads: config, project path, assets found (with sizes), main.scene contents
 
@@ -434,16 +434,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
     } catch (...) {}
 
-    // scan assets and load scene
-    ScanAssets();
-    LoadScene();
-
-    // initialize Gdiplus
+    // -------------------------
+    // IMPORTANT CHANGE: Initialize GDI+ BEFORE loading bitmaps
+    // -------------------------
     GdiplusStartupInput gsi;
     if (GdiplusStartup(&gToken, &gsi, NULL) != Ok) {
         Log("GdiplusStartup failed");
         return -1;
     }
+    Log("Gdiplus initialized successfully");
+
+    // scan assets and load scene (now GDI+ is ready so Bitmap::FromFile will work)
+    ScanAssets();
+    LoadScene();
 
     // register window
     WNDCLASS wc = {};
