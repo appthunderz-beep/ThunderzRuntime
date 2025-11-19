@@ -30,6 +30,32 @@ std::wstring ToW(const std::string& s) {
     return std::wstring(s.begin(), s.end());
 }
 
+std::string ReadFileToStringW(const std::wstring& path) {
+    // Open wide file handle
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return std::string();
+
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart == 0) {
+        CloseHandle(h);
+        return std::string();
+    }
+
+    DWORD fileSize = (DWORD)sz.QuadPart;
+    std::string buffer;
+    buffer.resize(fileSize);
+
+    DWORD read = 0;
+    if (!ReadFile(h, &buffer[0], fileSize, &read, NULL) || read != fileSize) {
+        CloseHandle(h);
+        return std::string();
+    }
+
+    CloseHandle(h);
+    return buffer;
+}
+
 void LoadConfig() {
     std::ifstream f("config.txt");
     if(!f) return;
@@ -52,8 +78,13 @@ void ScanAssets() {
         do {
             if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                 std::wstring name = fd.cFileName;
-                if(name.find(L".bmp") != std::wstring::npos) {
-                    assetFiles.push_back(name);
+                // only add bitmap files (simple filter)
+                if(name.size() > 4) {
+                    std::wstring ext = name.substr(name.size()-4);
+                    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+                    if(ext == L".bmp") {
+                        assetFiles.push_back(name);
+                    }
                 }
             }
         } while(FindNextFileW(h, &fd));
@@ -63,77 +94,80 @@ void ScanAssets() {
 
 void LoadScene() {
     std::wstring scenePath = PROJECT_PATH + L"\\scenes\\main.scene";
+    std::string s = ReadFileToStringW(scenePath);
+    if(s.empty()) return;
 
-    std::ifstream f(scenePath);
-    if(!f) return;
-
-    std::stringstream buffer;
-    buffer << f.rdbuf();
-    std::string s = buffer.str();
-
-    auto get = [&](const std::string& key, const std::string& line) -> std::string {
+    // Simple minimal JSON-ish parser tuned for the project's scene format
+    auto getQuoted = [&](const std::string& line, const std::string& key)->std::string{
         size_t p = line.find(key);
         if(p == std::string::npos) return "";
         size_t q = line.find("\"", p + key.size());
+        if(q == std::string::npos) return "";
         size_t r = line.find("\"", q + 1);
+        if(r == std::string::npos) return "";
         return line.substr(q+1, r-q-1);
     };
 
-    auto getNum = [&](const std::string& key, const std::string& line) -> int {
+    auto getNumber = [&](const std::string& line, const std::string& key)->int{
         size_t p = line.find(key);
         if(p == std::string::npos) return 0;
         size_t q = line.find(":", p);
-        size_t r = line.find(",", q);
-        return std::stoi(line.substr(q+1, r-q-1));
+        if(q == std::string::npos) return 0;
+        size_t r = line.find_first_of(",}", q+1);
+        std::string num = line.substr(q+1, r-q-1);
+        // trim
+        size_t a = num.find_first_not_of(" \t\r\n");
+        size_t b = num.find_last_not_of(" \t\r\n");
+        if(a==std::string::npos) return 0;
+        return std::stoi(num.substr(a, b-a+1));
     };
 
     std::stringstream ss(s);
     std::string line;
-
     while(std::getline(ss, line)) {
-        if(line.find("\"id\"") != std::string::npos &&
-           line.find("main") == std::string::npos &&
-           line.find("{") != std::string::npos)
-        {
-            Entity e;
-            std::getline(ss, line);
-            e.id = ToW(get("id", line));
-
-            std::getline(ss, line);
-            e.asset = ToW(get("asset", line));
-
-            std::getline(ss, line);
-            e.x = getNum("x", line);
-
-            std::getline(ss, line);
-            e.y = getNum("y", line);
-
-            std::getline(ss, line);
-            e.z = getNum("z", line);
-
-            entities.push_back(e);
+        // detect entity entry by looking for '{' followed by the keys; this is simple but matches our format
+        if(line.find("{") != std::string::npos) {
+            // peek next few lines for id/asset/x/y/z
+            std::streampos start = ss.tellg();
+            std::string l1, l2, l3, l4, l5;
+            if(std::getline(ss, l1) && std::getline(ss, l2) && std::getline(ss, l3) && std::getline(ss, l4) && std::getline(ss, l5)) {
+                // l1 should contain "id": ...
+                if(l1.find("\"id\"") != std::string::npos && l2.find("\"asset\"") != std::string::npos) {
+                    Entity e;
+                    e.id = ToW(getQuoted(l1, "\"id\""));
+                    e.asset = ToW(getQuoted(l2, "\"asset\""));
+                    e.x = getNumber(l3, "x");
+                    e.y = getNumber(l4, "y");
+                    e.z = getNumber(l5, "z");
+                    entities.push_back(e);
+                } else {
+                    // not an entity; rewind a bit by resetting stringstream to after '{'
+                    ss.seekg(start);
+                }
+            } else {
+                // fewer lines — nothing to do
+                break;
+            }
         }
     }
 
-    std::sort(entities.begin(), entities.end(), 
-        [](const Entity& a, const Entity& b){
-            return a.z < b.z;
-        });
+    std::sort(entities.begin(), entities.end(), [](const Entity& a, const Entity& b){
+        return a.z < b.z;
+    });
 }
 
 void LoadImages() {
     std::wstring ap = PROJECT_PATH + L"\\assets\\";
-
     for(auto& a : assetFiles) {
+        // Image accepts LPCWSTR
         Image* img = new Image((ap + a).c_str());
         loadedImages.push_back(img);
     }
 }
 
 Image* FindImage(const std::wstring& name) {
-    for(size_t i = 0; i < assetFiles.size(); i++) {
-        if(assetFiles[i] == name)
-            return loadedImages[i];
+    for(size_t i = 0; i < assetFiles.size(); ++i) {
+        if(assetFiles[i] == name) return loadedImages[i];
     }
     return nullptr;
 }
@@ -147,13 +181,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(hwnd, &ps);
             Graphics g(hdc);
 
-            SolidBrush bg(Color(255, 80, 100, 160));
+            // background (same blue-ish tone)
+            SolidBrush bg(Color(255, 70, 110, 170));
             g.FillRectangle(&bg, 0, 0, 2000, 2000);
 
+            // draw entities
             for(auto& e : entities) {
                 Image* im = FindImage(e.asset);
-                if(im)
+                if(im) {
                     g.DrawImage(im, e.x, e.y);
+                } else {
+                    // draw a placeholder if image missing
+                    SolidBrush rb(Color(255, 200, 60, 60));
+                    g.FillRectangle(&rb, e.x, e.y, 32, 32);
+                }
             }
 
             EndPaint(hwnd, &ps);
@@ -168,7 +209,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ------------------- ENTRY -------------------
 
-int APIENTRY wWinMain(HINSTANCE h, HINSTANCE, PWSTR, int) {
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     GdiplusStartupInput gi;
     ULONG_PTR token;
     GdiplusStartup(&token, &gi, NULL);
@@ -180,18 +221,19 @@ int APIENTRY wWinMain(HINSTANCE h, HINSTANCE, PWSTR, int) {
 
     WNDCLASSW wc = {0};
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
-    wc.hInstance = h;
-    wc.lpszClassName = L"RT";
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"ThunderzRuntimeClass";
     wc.lpfnWndProc = WndProc;
 
     RegisterClassW(&wc);
 
-    HWND win = CreateWindowW(L"RT", L"Thunderz Runtime",
+    HWND win = CreateWindowW(L"ThunderzRuntimeClass", L"Thunderz Runtime",
                              WS_OVERLAPPEDWINDOW,
                              10, 10, 1280, 720,
-                             NULL, NULL, h, NULL);
+                             NULL, NULL, hInstance, NULL);
 
-    ShowWindow(win, 1);
+    ShowWindow(win, SW_SHOWDEFAULT);
+    UpdateWindow(win);
 
     MSG msg;
     while(GetMessage(&msg, NULL, 0, 0)) {
@@ -199,5 +241,9 @@ int APIENTRY wWinMain(HINSTANCE h, HINSTANCE, PWSTR, int) {
         DispatchMessage(&msg);
     }
 
-    return 0;
+    // cleanup images
+    for(auto p : loadedImages) delete p;
+    GdiplusShutdown(token);
+    return (int)msg.wParam;
 }
+
