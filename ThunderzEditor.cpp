@@ -1,5 +1,5 @@
 // ThunderzEditor.cpp
-// Thunderz Editor - Phase1 UI (Custom modern style) - FIXED types
+// Thunderz Editor - Phase1 UI (Custom modern style) - sanitized config parsing + type fixes
 // Build with MinGW + GDI+:
 // g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode -mwindows
 
@@ -17,10 +17,12 @@
 #include <locale>
 #include <codecvt>
 #include <ctime>
+#include <filesystem>
 
 #pragma comment(lib, "gdiplus.lib")
 
 using namespace Gdiplus;
+namespace fs = std::filesystem;
 
 // ----------------- Utilities -----------------
 
@@ -92,7 +94,7 @@ static bool gdiInited = false;
 // ----------------- File helpers -----------------
 
 static bool ReadFileUtf8(const std::wstring &path, std::string &out) {
-    std::string p = WToUtf8(path);
+    std::string p = fs::path(path).string();
     std::ifstream f(p, std::ios::binary);
     if (!f.is_open()) return false;
     std::ostringstream ss; ss<<f.rdbuf();
@@ -100,7 +102,7 @@ static bool ReadFileUtf8(const std::wstring &path, std::string &out) {
     return true;
 }
 static bool WriteFileUtf8(const std::wstring &path, const std::string &data) {
-    std::string p = WToUtf8(path);
+    std::string p = fs::path(path).string();
     std::ofstream f(p, std::ios::binary);
     if (!f.is_open()) return false;
     f.write(data.data(), data.size());
@@ -147,7 +149,7 @@ static void LoadBitmaps() {
         if (b) {
             if (b->GetLastStatus()==Ok) {
                 a.bmp = b; a.w = b->GetWidth(); a.h = b->GetHeight();
-                AppendLog("Loaded bitmap: " + WToUtf8(a.name));
+                AppendLog("Loaded bitmap: " + WToUtf8(a.name) + " (" + std::to_string(a.w) + "x" + std::to_string(a.h) + ")");
             } else {
                 delete b;
                 AppendLog("Failed bitmap load (status): " + WToUtf8(a.name));
@@ -159,9 +161,14 @@ static void LoadBitmaps() {
 static void ParseScene() {
     entities.clear();
     std::wstring scenePath = projectPath + L"\\scenes\\main.scene";
+    AppendLog("Loading scene from: " + WToUtf8(scenePath));
     std::string content;
     if (!ReadFileUtf8(scenePath, content)) { AppendLog("main.scene missing or unreadable"); return; }
-    AppendLog("Scene loaded: " + content.substr(0, std::min<size_t>(content.size(),1024)));
+    // strip BOM if present
+    if (content.size() >= 3 && (unsigned char)content[0] == 0xEF && (unsigned char)content[1] == 0xBB && (unsigned char)content[2] == 0xBF) {
+        content = content.substr(3);
+    }
+    AppendLog("Scene file content (first 1024 bytes):\n" + content.substr(0, std::min<size_t>(content.size(),1024)));
     // Minimal parser (tuned for your simple format)
     size_t pos=0;
     while (true) {
@@ -218,7 +225,7 @@ static void ParseScene() {
         Asset* a = FindAsset(en.asset);
         if (a) en.assetPtr = a;
     }
-    AppendLog("Parsed entities: " + std::to_string(entities.size()));
+    AppendLog("Loaded entities count: " + std::to_string(entities.size()));
 }
 
 static void SaveScene() {
@@ -544,13 +551,43 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     std::string content;
     if (ReadFileUtf8(cfg, content)) {
         AppendLog("Read config: " + content.substr(0, std::min<size_t>(content.size(), 1024)));
-        // parse project_path line
+
+        // parse project_path line robustly and sanitize it
         std::istringstream iss(content);
         std::string line;
-        while (std::getline(iss,line)) {
-            if (line.rfind("project_path=",0)==0) {
-                std::string val = line.substr(strlen("project_path="));
-                projectPath = Utf8ToW(val);
+        while (std::getline(iss, line)) {
+            // remove any trailing CR leftover from CRLF (common on Windows)
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            const std::string prefix = "project_path=";
+            if (line.rfind(prefix, 0) == 0) {
+                std::string val = line.substr(prefix.size());
+
+                // Trim leading/trailing whitespace and remove control chars
+                auto is_control = [](char c){
+                    return (c=='\r' || c=='\n' || c=='\t' || c==0);
+                };
+                // trim front
+                size_t start = 0;
+                while (start < val.size() && isspace((unsigned char)val[start])) ++start;
+                // trim back and control chars
+                size_t end = val.size();
+                while (end > start && (isspace((unsigned char)val[end-1]) || is_control(val[end-1]))) --end;
+                std::string clean = val.substr(start, end - start);
+
+                // Also remove any stray internal CR/LF characters (defensive)
+                clean.erase(std::remove_if(clean.begin(), clean.end(), [](char c){
+                    return c == '\r' || c == '\n' || c == '\t';
+                }), clean.end());
+
+                // convert UTF-8 -> wstring
+                projectPath = Utf8ToW(clean);
+
+                // Final sanitize of wide string: remove control wchar_t values
+                projectPath.erase(std::remove_if(projectPath.begin(), projectPath.end(), [](wchar_t c){
+                    return c == L'\r' || c == L'\n' || c == L'\t' || c == 0;
+                }), projectPath.end());
+
                 AppendLog("Resolved project path: " + WToUtf8(projectPath));
                 break;
             }
@@ -605,4 +642,5 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     AppendLog("Editor exiting");
     return 0;
 }
+
 
