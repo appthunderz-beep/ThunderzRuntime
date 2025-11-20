@@ -1,6 +1,5 @@
 // ThunderzEditor.cpp
-// Thunderz Editor - Phase1 UI (Custom modern style)
-// Drop-in replacement for current editor (minimal dependencies).
+// Thunderz Editor - Phase1 UI (Custom modern style) - FIXED types
 // Build with MinGW + GDI+:
 // g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode -mwindows
 
@@ -241,25 +240,6 @@ static void SaveScene() {
 
 // ----------------- UI helpers -----------------
 
-static void DrawRoundedRect(Graphics &g, REAL x, REAL y, REAL w, REAL h, REAL r, const Gdiplus::Brush &brush) {
-    // approximate rounded rect by filling rectangle and draw corners (simple)
-    g.FillRectangle(&brush, x+r, y, w-2*r, h);
-    g.FillRectangle(&brush, x, y+r, r, h-2*r);
-    g.FillRectangle(&brush, x+w-r, y+r, r, h-2*r);
-    // center fill
-    g.FillRectangle(&brush, x+r, y+r, w-2*r, h-2*r);
-    // corners as filled circles
-    SolidBrush tmpBrush(Color(255,0,0,0));
-    GraphicsPath path;
-    path.AddEllipse(RectF(x, y, 2*r, 2*r));
-    path.AddEllipse(RectF(x+w-2*r, y, 2*r, 2*r));
-    path.AddEllipse(RectF(x, y+h-2*r, 2*r, 2*r));
-    path.AddEllipse(RectF(x+w-2*r, y+h-2*r, 2*r, 2*r));
-    // we can't easily fill path with existing brush reference; use brush by color extraction not ideal.
-    // Simpler: draw circle fills using same brush by creating SolidBrush with sampled color.
-}
-
-// small helper to draw text with nice default font
 static void DrawTextNice(Graphics &g, const std::wstring &text, REAL x, REAL y, REAL size=12.0f) {
     FontFamily ff(L"Segoe UI");
     Font font(&ff, size, FontStyleRegular, UnitPixel);
@@ -337,15 +317,15 @@ static void PaintAll(HDC hdc) {
         Entity &en = entities[idx];
         if (en.assetPtr && en.assetPtr->bmp) {
             Bitmap *bmp = en.assetPtr->bmp;
-            REAL dx = (REAL)leftW + en.x;
-            REAL dy = (REAL)toolbarH + en.y;
+            REAL dx = (REAL)leftW + (REAL)en.x;
+            REAL dy = (REAL)toolbarH + (REAL)en.y;
             g.DrawImage(bmp, dx, dy, (REAL)en.assetPtr->w, (REAL)en.assetPtr->h);
         } else {
             // placeholder
             SolidBrush ph(Color(255,180,60,60));
-            g.FillRectangle(&ph, (REAL)leftW + en.x, (REAL)toolbarH + en.y, 48, 48);
+            g.FillRectangle(&ph, (REAL)leftW + (REAL)en.x, (REAL)toolbarH + (REAL)en.y, (REAL)48, (REAL)48);
             Font small(&ff,10, FontStyleRegular, UnitPixel);
-            g.DrawString(Utf8ToW(en.id).c_str(), -1, &small, PointF(leftW + en.x + 2, toolbarH + en.y + 2), &white);
+            g.DrawString(Utf8ToW(en.id).c_str(), -1, &small, PointF((REAL)leftW + (REAL)en.x + 2, (REAL)toolbarH + (REAL)en.y + 2), &white);
         }
     }
 
@@ -353,9 +333,9 @@ static void PaintAll(HDC hdc) {
     if (selectedEntity >=0 && selectedEntity < (int)entities.size()) {
         Entity &s = entities[selectedEntity];
         Pen selPen(Color(255,180,220,255), 2.0f);
-        RealRectF rect((REAL)leftW + s.x - 3, (REAL)toolbarH + s.y - 3,
-                       (s.assetPtr? (REAL)s.assetPtr->w + 6 : 54.0f),
-                       (s.assetPtr? (REAL)s.assetPtr->h + 6 : 54.0f));
+        RectF rect((REAL)leftW + (REAL)s.x - 3.0f, (REAL)toolbarH + (REAL)s.y - 3.0f,
+                       (s.assetPtr? (REAL)s.assetPtr->w + 6.0f : 54.0f),
+                       (s.assetPtr? (REAL)s.assetPtr->h + 6.0f : 54.0f));
         g.DrawRectangle(&selPen, rect.X, rect.Y, rect.Width, rect.Height);
     }
 
@@ -378,8 +358,8 @@ static void PaintAll(HDC hdc) {
     int count=0;
     for (auto &a: assets) {
         if (a.bmp) {
-            REAL px = (REAL)ax + (count%2)*(thumb+gap);
-            REAL py = (REAL)ay + (count/2)*(thumb+gap);
+            REAL px = (REAL)ax + (REAL)(count%2)*(thumb+gap);
+            REAL py = (REAL)ay + (REAL)(count/2)*(thumb+gap);
             g.DrawImage(a.bmp, px, py, (REAL)thumb, (REAL)thumb);
             // name
             Font aname(&ff, 9.0f, FontStyleRegular, UnitPixel);
@@ -388,7 +368,7 @@ static void PaintAll(HDC hdc) {
         } else {
             // placeholder
             SolidBrush pb(Color(255,40,40,40));
-            g.FillRectangle(&pb, ax + (count%2)*(thumb+gap), ay + (count/2)*(thumb+gap), thumb, thumb);
+            g.FillRectangle(&pb, (REAL)ax + (REAL)(count%2)*(thumb+gap), (REAL)ay + (REAL)(count/2)*(thumb+gap), (REAL)thumb, (REAL)thumb);
             count++;
         }
     }
@@ -415,7 +395,6 @@ static void PaintAll(HDC hdc) {
         g.DrawString(L"Z:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
         g.DrawString(std::to_wstring(si.z).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
         insY += 32;
-        // Small Save hint
         Font small(&ff, 10.0f, FontStyleRegular, UnitPixel);
         g.DrawString(L"Edit values by typing into console (TODO: GUI fields)", -1, &small, PointF((REAL)insX, (REAL)insY), &white);
     } else {
@@ -626,3 +605,4 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     AppendLog("Editor exiting");
     return 0;
 }
+
