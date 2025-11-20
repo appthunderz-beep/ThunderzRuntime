@@ -1,11 +1,8 @@
-// ThunderzEditor.cpp
-// Minimal Thunderz Editor with scene loading, drag, and inspector editing.
-// Build with: g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
-
 #define UNICODE
 #define _WIN32_WINNT 0x0601
 
 #include <windows.h>
+#include <windowsx.h>
 #include <gdiplus.h>
 #include <string>
 #include <vector>
@@ -17,6 +14,9 @@
 #include <codecvt>
 #include <locale>
 #include <chrono>
+#include <iomanip>
+#include <ctime>
+
 
 using namespace Gdiplus;
 namespace fs = std::filesystem;
