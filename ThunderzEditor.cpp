@@ -1,646 +1,639 @@
 // ThunderzEditor.cpp
-// Thunderz Editor - Phase1 UI (Custom modern style) - sanitized config parsing + type fixes
-// Build with MinGW + GDI+:
-// g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode -mwindows
+// Minimal Thunderz Editor with scene loading, drag, and inspector editing.
+// Build with: g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode
 
 #define UNICODE
-#define _UNICODE
+#define _WIN32_WINNT 0x0601
 
 #include <windows.h>
-#include <windowsx.h>
 #include <gdiplus.h>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include <algorithm>
-#include <locale>
-#include <codecvt>
-#include <ctime>
+#include <iostream>
 #include <filesystem>
-
-#pragma comment(lib, "gdiplus.lib")
+#include <algorithm>
+#include <codecvt>
+#include <locale>
+#include <chrono>
 
 using namespace Gdiplus;
 namespace fs = std::filesystem;
 
-// ----------------- Utilities -----------------
-
-static std::string CurrentTimestamp()
-{
-    time_t t = time(nullptr);
-    struct tm tmv;
-    localtime_s(&tmv, &t);
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
-    return std::string(buf);
+// Simple logger
+void Log(const std::wstring &s) {
+    std::wofstream f("editor.log", std::ios::app);
+    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::wstring timew(64, L'\0');
+    std::wstringstream ss; ss << std::put_time(std::localtime(&t), L"%Y-%m-%d %H:%M:%S");
+    std::wstring line = ss.str() + L" - " + s + L"\n";
+    f << line;
+    f.close();
 }
 
-static void AppendLog(const std::string &s)
-{
-    std::ofstream f("editor.log", std::ios::app);
-    if (f.is_open()) {
-        f << CurrentTimestamp() << " - " << s << "\n";
-    }
+// Helper: convert narrow -> wide and vice versa
+std::wstring s2ws(const std::string &s) {
+    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+    return conv.from_bytes(s);
+}
+std::string ws2s(const std::wstring &w) {
+    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+    return conv.to_bytes(w);
 }
 
-static std::wstring Utf8ToW(const std::string &s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
-    std::wstring w; w.resize(n);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
-}
-static std::string WToUtf8(const std::wstring &w) {
-    if (w.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
-    std::string s; s.resize(n);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, NULL, NULL);
-    return s;
-}
-
-// ----------------- Data -----------------
-
-struct Asset {
-    std::wstring name;
-    std::wstring fullPath;
-    Bitmap *bmp = nullptr;
-    UINT w=0,h=0;
-};
-
+// Entity representation
 struct Entity {
     std::string id;
-    std::wstring asset; // asset filename (wide)
-    int x=0,y=0,z=0;
-    Asset* assetPtr = nullptr;
+    std::string asset; // filename only
+    int x=0, y=0, z=0;
+    int w=48, h=48;
+    Bitmap* bmp = nullptr; // owned by editor (not deleted when removed)
 };
 
-static std::wstring exeFolder;
-static std::wstring projectPath;
-static std::vector<Asset> assets;
-static std::vector<Entity> entities;
-static int selectedEntity = -1;
+// Globals
+HINSTANCE g_hInst = NULL;
+HWND g_hWnd = NULL;
+int g_winW = 1280, g_winH = 720;
+std::wstring g_exeFolder;
+std::wstring g_projectPath;
+std::vector<std::pair<std::string, Bitmap*>> g_assets; // filename -> Bitmap*
+std::vector<Entity> g_entities;
+int g_selectedIndex = -1;
+bool g_documentDirty = false;
 
-// UI layout values (will compute on resize)
-static int winW = 1280, winH = 720;
-static int toolbarH = 44;
-static int leftW = 220;
-static int rightW = 300;
-static int assetsH = 180;
-static HWND hwndGlobal = NULL;
-static ULONG_PTR gdiToken = 0;
-static bool gdiInited = false;
+// UI panes sizes
+int leftPanelW = 160;
+int inspectorW = 320;
+int bottomPanelH = 140;
+int toolbarH = 48;
 
-// ----------------- File helpers -----------------
+// Inspector controls
+HWND hEditX = NULL, hEditY = NULL, hEditZ = NULL;
+HWND hBtnApply = NULL;
 
-static bool ReadFileUtf8(const std::wstring &path, std::string &out) {
-    std::string p = fs::path(path).string();
+// Dragging state
+bool g_isDragging = false;
+int g_dragIndex = -1;
+int g_dragOffsetX = 0;
+int g_dragOffsetY = 0;
+
+// Forward
+void RepaintWindow();
+void UpdateInspectorFields();
+int HitTestEntity(int px, int py);
+void SaveScene();
+
+std::wstring ReadAllTextW(const fs::path &p) {
     std::ifstream f(p, std::ios::binary);
-    if (!f.is_open()) return false;
-    std::ostringstream ss; ss<<f.rdbuf();
-    out = ss.str();
-    return true;
-}
-static bool WriteFileUtf8(const std::wstring &path, const std::string &data) {
-    std::string p = fs::path(path).string();
-    std::ofstream f(p, std::ios::binary);
-    if (!f.is_open()) return false;
-    f.write(data.data(), data.size());
-    return true;
+    if (!f) return L"";
+    std::ostringstream ss; ss << f.rdbuf();
+    std::string s = ss.str();
+    return s2ws(s);
 }
 
-static std::wstring GetExeFolder() {
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(NULL, buf, MAX_PATH);
-    std::wstring p(buf, buf + n);
-    size_t pos = p.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) p = p.substr(0, pos);
-    return p;
+std::string ReadAllTextA(const fs::path &p) {
+    std::ifstream f(p);
+    if (!f) return "";
+    std::ostringstream ss; ss << f.rdbuf();
+    return ss.str();
 }
 
-// ----------------- Load project & assets & scene -----------------
-
-static void ScanAssetsFolder() {
-    assets.clear();
-    std::wstring ad = projectPath + L"\\assets";
-    AppendLog("Scanning assets in: " + WToUtf8(ad));
-    std::wstring search = ad + L"\\*.*";
-    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(search.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::wstring name = fd.cFileName;
-        Asset a; a.name = name; a.fullPath = ad + L"\\" + name;
-        assets.push_back(a);
-        AppendLog("Found asset: " + WToUtf8(name));
-    } while (FindNextFileW(h,&fd));
-    FindClose(h);
-}
-
-static Asset* FindAsset(const std::wstring &name) {
-    for (auto &a: assets) if (a.name==name) return &a;
-    return nullptr;
-}
-
-static void LoadBitmaps() {
-    for (auto &a: assets) {
-        if (a.bmp) { delete a.bmp; a.bmp=nullptr;}
-        Bitmap *b = Bitmap::FromFile(a.fullPath.c_str(), false);
-        if (b) {
-            if (b->GetLastStatus()==Ok) {
-                a.bmp = b; a.w = b->GetWidth(); a.h = b->GetHeight();
-                AppendLog("Loaded bitmap: " + WToUtf8(a.name) + " (" + std::to_string(a.w) + "x" + std::to_string(a.h) + ")");
-            } else {
-                delete b;
-                AppendLog("Failed bitmap load (status): " + WToUtf8(a.name));
-            }
-        } else AppendLog("Bitmap null: " + WToUtf8(a.name));
-    }
-}
-
-static void ParseScene() {
-    entities.clear();
-    std::wstring scenePath = projectPath + L"\\scenes\\main.scene";
-    AppendLog("Loading scene from: " + WToUtf8(scenePath));
-    std::string content;
-    if (!ReadFileUtf8(scenePath, content)) { AppendLog("main.scene missing or unreadable"); return; }
-    // strip BOM if present
-    if (content.size() >= 3 && (unsigned char)content[0] == 0xEF && (unsigned char)content[1] == 0xBB && (unsigned char)content[2] == 0xBF) {
-        content = content.substr(3);
-    }
-    AppendLog("Scene file content (first 1024 bytes):\n" + content.substr(0, std::min<size_t>(content.size(),1024)));
-    // Minimal parser (tuned for your simple format)
-    size_t pos=0;
-    while (true) {
-        size_t b = content.find('{', pos);
-        if (b==std::string::npos) break;
-        size_t e = content.find('}', b);
-        if (e==std::string::npos) break;
-        std::string block = content.substr(b, e-b+1);
-        if (block.find("\"asset\"")!=std::string::npos) {
-            Entity ent;
-            // id
-            size_t p = block.find("\"id\"");
-            if (p!=std::string::npos) {
-                size_t q = block.find('"', p+4);
-                size_t r = block.find('"', q+1);
-                size_t s = block.find('"', r+1);
-                size_t t = block.find('"', s+1);
-                if (s!=std::string::npos && t!=std::string::npos) {
-                    std::string val = block.substr(s+1, t-s-1);
-                    ent.id = val;
-                }
-            }
-            // asset
-            p = block.find("\"asset\"");
-            if (p!=std::string::npos) {
-                size_t q = block.find('"', p+6);
-                size_t r = block.find('"', q+1);
-                size_t s = block.find('"', r+1);
-                size_t t = block.find('"', s+1);
-                if (s!=std::string::npos && t!=std::string::npos) {
-                    std::string val = block.substr(s+1, t-s-1);
-                    ent.asset = Utf8ToW(val);
-                }
-            }
-            // x,y,z
-            auto getNum=[&](const std::string &blk, const char key)->int{
-                size_t pp=blk.find(std::string("\"")+std::string(1,key)+std::string("\""));
-                if (pp==std::string::npos) return 0;
-                size_t colon = blk.find(':', pp);
-                if (colon==std::string::npos) return 0;
-                size_t comma = blk.find_first_of(",}", colon+1);
-                std::string s = blk.substr(colon+1, comma-colon-1);
-                try { return std::stoi(s); } catch(...) { return 0; }
-            };
-            ent.x = getNum(block,'x');
-            ent.y = getNum(block,'y');
-            ent.z = getNum(block,'z');
-            entities.push_back(ent);
-        }
-        pos = e+1;
-    }
-    // attach asset pointers
-    for (auto &en: entities) {
-        Asset* a = FindAsset(en.asset);
-        if (a) en.assetPtr = a;
-    }
-    AppendLog("Loaded entities count: " + std::to_string(entities.size()));
-}
-
-static void SaveScene() {
-    // simple serializer matching original format
-    std::wstring scenePath = projectPath + L"\\scenes\\main.scene";
-    std::ostringstream ss;
-    ss << "{\n  \"id\":\"main\",\n  \"entities\":[\n";
-    for (size_t i=0;i<entities.size();++i) {
-        auto &e = entities[i];
-        ss << "    { \"id\":\"" << e.id << "\", \"asset\":\"" << WToUtf8(e.asset) << "\", \"x\":" << e.x << ", \"y\":" << e.y << ", \"z\":" << e.z << " }";
-        if (i+1<entities.size()) ss << ",";
-        ss << "\n";
-    }
-    ss << "  ],\n  \"script\":[]\n}\n";
-    std::string out = ss.str();
-    bool ok = WriteFileUtf8(scenePath, out);
-    AppendLog(std::string("Saved scene: ") + (ok? "OK":"FAILED"));
-}
-
-// ----------------- UI helpers -----------------
-
-static void DrawTextNice(Graphics &g, const std::wstring &text, REAL x, REAL y, REAL size=12.0f) {
-    FontFamily ff(L"Segoe UI");
-    Font font(&ff, size, FontStyleRegular, UnitPixel);
-    SolidBrush col(Color(255,240,240,240));
-    PointF pt(x,y);
-    g.DrawString(text.c_str(), -1, &font, pt, &col);
-}
-
-// ----------------- Painting -----------------
-
-static void PaintAll(HDC hdc) {
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeHighQuality);
-    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
-
-    // background
-    LinearGradientBrush bgBrush(Rect(0,0,winW,winH), Color(255,25,25,30), Color(255,18,24,36), LinearGradientModeVertical);
-    g.FillRectangle(&bgBrush, 0, 0, winW, winH);
-
-    // toolbar
-    RectF toolbarRect(0,0, (REAL)winW, (REAL)toolbarH);
-    SolidBrush toolbarBg(Color(255,18,18,20));
-    g.FillRectangle(&toolbarBg, toolbarRect);
-
-    FontFamily ff(L"Segoe UI");
-    Font fnt(&ff, 16.0f, FontStyleBold, UnitPixel);
-    SolidBrush white(Color(255,230,230,235));
-    PointF titlePt(12.0f, 12.0f);
-    g.DrawString(L"Thunderz Engine - Editor", -1, &fnt, titlePt, &white);
-
-    // toolbar buttons (Save, Play)
-    RectF saveR(220,6,96,32), playR(324,6,96,32);
-    SolidBrush saveBg(Color(255,40,120,70));
-    SolidBrush playBg(Color(255,60,90,160));
-    g.FillRectangle(&saveBg, saveR);
-    g.FillRectangle(&playBg, playR);
-    Font btnF(&ff,12.0f, FontStyleRegular, UnitPixel);
-    SolidBrush btnTxt(Color(255,245,245,245));
-    g.DrawString(L"Save (S)", -1, &btnF, PointF(saveR.X+18, saveR.Y+8), &btnTxt);
-    g.DrawString(L"Play (P)", -1, &btnF, PointF(playR.X+20, playR.Y+8), &btnTxt);
-
-    // left panel (Hierarchy)
-    RectF leftRect(0, toolbarH, (REAL)leftW, (REAL)(winH - toolbarH));
-    SolidBrush panelBg(Color(255,20,20,24));
-    g.FillRectangle(&panelBg, leftRect);
-    // header
-    g.DrawString(L"Hierarchy", -1, &btnF, PointF(12, toolbarH + 8), &white);
-
-    // right panel (Inspector)
-    RectF rightRect((REAL)(winW-rightW), (REAL)toolbarH, (REAL)rightW, (REAL)(winH - toolbarH));
-    SolidBrush rightBg(Color(255,18,18,22));
-    g.FillRectangle(&rightBg, rightRect);
-    g.DrawString(L"Inspector", -1, &btnF, PointF((REAL)(winW-rightW)+12, toolbarH+8), &white);
-
-    // bottom-left assets area
-    RectF assetsRect(0, (REAL)(winH-assetsH), (REAL)leftW, (REAL)assetsH);
-    SolidBrush assetsBg(Color(255,14,14,18));
-    g.FillRectangle(&assetsBg, assetsRect);
-    g.DrawString(L"Assets", -1, &btnF, PointF(12, (REAL)(winH-assetsH)+8), &white);
-
-    // scene view rect
-    RectF sceneRect((REAL)leftW, (REAL)toolbarH, (REAL)(winW-leftW-rightW), (REAL)(winH-toolbarH-assetsH));
-    SolidBrush sceneBg(Color(255,30,30,36));
-    g.FillRectangle(&sceneBg, sceneRect);
-
-    // draw entities in scene
-    // sort by z
-    std::vector<int> order;
-    for (size_t i=0;i<entities.size();++i) order.push_back((int)i);
-    std::sort(order.begin(), order.end(), [&](int a, int b){
-        return entities[a].z < entities[b].z;
-    });
-
-    for (int idx: order) {
-        Entity &en = entities[idx];
-        if (en.assetPtr && en.assetPtr->bmp) {
-            Bitmap *bmp = en.assetPtr->bmp;
-            REAL dx = (REAL)leftW + (REAL)en.x;
-            REAL dy = (REAL)toolbarH + (REAL)en.y;
-            g.DrawImage(bmp, dx, dy, (REAL)en.assetPtr->w, (REAL)en.assetPtr->h);
-        } else {
-            // placeholder
-            SolidBrush ph(Color(255,180,60,60));
-            g.FillRectangle(&ph, (REAL)leftW + (REAL)en.x, (REAL)toolbarH + (REAL)en.y, (REAL)48, (REAL)48);
-            Font small(&ff,10, FontStyleRegular, UnitPixel);
-            g.DrawString(Utf8ToW(en.id).c_str(), -1, &small, PointF((REAL)leftW + (REAL)en.x + 2, (REAL)toolbarH + (REAL)en.y + 2), &white);
-        }
-    }
-
-    // highlight selected entity with outline
-    if (selectedEntity >=0 && selectedEntity < (int)entities.size()) {
-        Entity &s = entities[selectedEntity];
-        Pen selPen(Color(255,180,220,255), 2.0f);
-        RectF rect((REAL)leftW + (REAL)s.x - 3.0f, (REAL)toolbarH + (REAL)s.y - 3.0f,
-                       (s.assetPtr? (REAL)s.assetPtr->w + 6.0f : 54.0f),
-                       (s.assetPtr? (REAL)s.assetPtr->h + 6.0f : 54.0f));
-        g.DrawRectangle(&selPen, rect.X, rect.Y, rect.Width, rect.Height);
-    }
-
-    // draw hierarchy list
-    Font hfont(&ff, 12.0f, FontStyleRegular, UnitPixel);
-    int y = toolbarH + 36;
-    for (size_t i=0;i<entities.size();++i) {
-        Entity &e = entities[i];
-        RectF item((REAL)8, (REAL)y, (REAL)leftW - 16, 24.0f);
-        SolidBrush itemBg((i==selectedEntity)? Color(255,40,40,60) : Color(255,18,18,22));
-        g.FillRectangle(&itemBg, item);
-        g.DrawString(Utf8ToW(e.id).c_str(), -1, &hfont, PointF(12, (REAL)y+4), &white);
-        y += 28;
-    }
-
-    // draw assets thumbnails (grid)
-    int ax = 8, ay = winH - assetsH + 36;
-    int thumb = 64;
-    int gap = 8;
-    int count=0;
-    for (auto &a: assets) {
-        if (a.bmp) {
-            REAL px = (REAL)ax + (REAL)(count%2)*(thumb+gap);
-            REAL py = (REAL)ay + (REAL)(count/2)*(thumb+gap);
-            g.DrawImage(a.bmp, px, py, (REAL)thumb, (REAL)thumb);
-            // name
-            Font aname(&ff, 9.0f, FontStyleRegular, UnitPixel);
-            g.DrawString(a.name.c_str(), -1, &aname, PointF(px, py+thumb+2), &white);
-            count++;
-        } else {
-            // placeholder
-            SolidBrush pb(Color(255,40,40,40));
-            g.FillRectangle(&pb, (REAL)ax + (REAL)(count%2)*(thumb+gap), (REAL)ay + (REAL)(count/2)*(thumb+gap), (REAL)thumb, (REAL)thumb);
-            count++;
-        }
-    }
-
-    // inspector content (if selected)
-    if (selectedEntity>=0 && selectedEntity < (int)entities.size()) {
-        Entity &si = entities[selectedEntity];
-        int insX = winW - rightW + 12;
-        int insY = toolbarH + 36;
-        Font lab(&ff, 11.0f, FontStyleRegular, UnitPixel);
-        g.DrawString(L"ID:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
-        g.DrawString(Utf8ToW(si.id).c_str(), -1, &lab, PointF((REAL)insX+40, (REAL)insY), &white);
-        insY += 28;
-        g.DrawString(L"Asset:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
-        std::wstring an = si.asset.empty()? L"(none)": si.asset;
-        g.DrawString(an.c_str(), -1, &lab, PointF((REAL)insX+60, (REAL)insY), &white);
-        insY += 28;
-        g.DrawString(L"X:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
-        g.DrawString(std::to_wstring(si.x).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
-        insY += 22;
-        g.DrawString(L"Y:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
-        g.DrawString(std::to_wstring(si.y).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
-        insY += 22;
-        g.DrawString(L"Z:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
-        g.DrawString(std::to_wstring(si.z).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
-        insY += 32;
-        Font small(&ff, 10.0f, FontStyleRegular, UnitPixel);
-        g.DrawString(L"Edit values by typing into console (TODO: GUI fields)", -1, &small, PointF((REAL)insX, (REAL)insY), &white);
-    } else {
-        Font lab(&ff, 11.0f, FontStyleRegular, UnitPixel);
-        g.DrawString(L"No selection", -1, &lab, PointF((REAL)(winW-rightW)+12, (REAL)toolbarH+36), &white);
-    }
-}
-
-// ----------------- Mouse handling -----------------
-
-static bool PointInRect(int px, int py, int rx, int ry, int rw, int rh) {
-    return (px>=rx && px<=rx+rw && py>=ry && py<=ry+rh);
-}
-
-static void OnLButtonDown(int mx, int my) {
-    // check toolbar Save/Play
-    if (my >= 6 && my <= 6+32 && mx >= 220 && mx <= 220+96) {
-        SaveScene();
-        AppendLog("User clicked Save");
-        InvalidateRect(hwndGlobal, NULL, TRUE);
+// Very simple scene parser for the specific format (no dependencies)
+void LoadSceneFile(const fs::path &scenePath) {
+    g_entities.clear();
+    if (!fs::exists(scenePath)) {
+        Log(L"LoadSceneFile: scene file missing: " + scenePath.native());
         return;
     }
-    // compute scene area origin
-    int sceneX = leftW;
-    int sceneY = toolbarH;
-    int sceneW = winW - leftW - rightW;
-    int sceneH = winH - toolbarH - assetsH;
-    // click inside scene?
-    if (PointInRect(mx,my, sceneX, sceneY, sceneW, sceneH)) {
-        // translate
-        int sx = mx - sceneX;
-        int sy = my - sceneY;
-        // find topmost entity under click (reverse z)
-        int hit = -1;
-        for (int i = (int)entities.size()-1; i>=0; --i) {
-            Entity &e = entities[i];
-            int ex = e.x, ey = e.y;
-            int ew = (e.assetPtr? (int)e.assetPtr->w : 48);
-            int eh = (e.assetPtr? (int)e.assetPtr->h : 48);
-            if (sx >= ex && sx <= ex+ew && sy >= ey && sy <= ey+eh) { hit = i; break; }
+    std::string content = ReadAllTextA(scenePath);
+    // naive parse: find occurrences of {"id":...,"asset":...,"x":..., "y":..., "z":...}
+    size_t pos = 0;
+    while (true) {
+        size_t brace = content.find('{', pos);
+        if (brace == std::string::npos) break;
+        size_t end = content.find('}', brace);
+        if (end == std::string::npos) break;
+        std::string block = content.substr(brace, end - brace + 1);
+        // find id
+        auto getStr = [&](const std::string &key)->std::string {
+            size_t p = block.find("\"" + key + "\"");
+            if (p==std::string::npos) return "";
+            size_t colon = block.find(':', p);
+            if (colon==std::string::npos) return "";
+            size_t quote = block.find('"', colon);
+            if (quote==std::string::npos) return "";
+            size_t quote2 = block.find('"', quote+1);
+            if (quote2==std::string::npos) return "";
+            return block.substr(quote+1, quote2-quote-1);
+        };
+        auto getInt = [&](const std::string &key, int def)->int {
+            size_t p = block.find("\"" + key + "\"");
+            if (p==std::string::npos) return def;
+            size_t colon = block.find(':', p);
+            if (colon==std::string::npos) return def;
+            size_t start = colon+1;
+            while (start<block.size() && (block[start]==' ' || block[start]=='\t')) ++start;
+            size_t finish = start;
+            while (finish<block.size() && ( (block[finish]>='0' && block[finish]<='9') || block[finish]=='-' )) finish++;
+            if (finish==start) return def;
+            std::string num = block.substr(start, finish-start);
+            try { return stoi(num); } catch(...) { return def; }
+        };
+        std::string id = getStr("id");
+        std::string asset = getStr("asset");
+        int x = getInt("x", 0);
+        int y = getInt("y", 0);
+        int z = getInt("z", 0);
+        // if it has id or asset, treat as entity
+        if (!id.empty() || !asset.empty()) {
+            Entity e;
+            e.id = id.empty() ? "entity" : id;
+            e.asset = asset;
+            e.x = x; e.y = y; e.z = z;
+            // lookup loaded bitmap to set w/h later
+            e.bmp = nullptr;
+            for (auto &p : g_assets) {
+                if (p.first == e.asset) { e.bmp = p.second; break; }
+            }
+            if (e.bmp) {
+                e.w = (int)e.bmp->GetWidth();
+                e.h = (int)e.bmp->GetHeight();
+            }
+            g_entities.push_back(e);
         }
-        if (hit!=-1) {
-            selectedEntity = hit;
-            AppendLog("Selected entity (scene click): " + entities[hit].id);
-            InvalidateRect(hwndGlobal, NULL, TRUE);
-            return;
-        } else {
-            selectedEntity = -1;
-            InvalidateRect(hwndGlobal, NULL, TRUE);
-            return;
-        }
+        pos = end + 1;
     }
-    // click in hierarchy (left)
-    int hy = toolbarH + 36;
-    for (size_t i=0;i<entities.size();++i) {
-        int itemY = hy + (int)i * 28;
-        if (PointInRect(mx,my, 8, itemY, leftW-16, 24)) {
-            selectedEntity = (int)i;
-            AppendLog("Selected entity (hierarchy): " + entities[i].id);
-            InvalidateRect(hwndGlobal, NULL, TRUE);
-            return;
-        }
+    Log(L"Loaded entities count: " + std::to_wstring(g_entities.size()));
+}
+
+void ScanAssets() {
+    g_assets.clear();
+    fs::path assetsFolder = fs::path(g_projectPath) / "assets";
+    if (!fs::exists(assetsFolder)) {
+        Log(L"ScanAssets: assets folder missing: " + assetsFolder.native());
+        return;
     }
-    // click in assets area - add new entity at (10,10)
-    int ax = 8, ay = winH - assetsH + 36;
-    int thumb = 64, gap=8;
-    int col = (mx - ax) / (thumb + gap);
-    if (mx >= ax && my >= ay) {
-        int index = (my - ay) / (thumb + gap) * 2 + col;
-        if (index >=0 && index < (int)assets.size()) {
-            // create new entity
-            Entity ne;
-            ne.id = "entity_" + std::to_string(entities.size()+1);
-            ne.asset = assets[index].name;
-            ne.x = 20; ne.y = 20; ne.z = 0;
-            ne.assetPtr = &assets[index];
-            entities.push_back(ne);
-            selectedEntity = (int)entities.size()-1;
-            AppendLog("Created entity from asset: " + WToUtf8(ne.asset));
-            InvalidateRect(hwndGlobal, NULL, TRUE);
-            return;
+    for (auto &it : fs::directory_iterator(assetsFolder)) {
+        if (!it.is_regular_file()) continue;
+        std::string name = it.path().filename().u8string();
+        std::string ext = it.path().extension().u8string();
+        // support .bmp only for now
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".bmp" || ext == ".png" || ext == ".jpg") {
+            // load via Gdiplus
+            std::wstring full = it.path().wstring();
+            Bitmap* bmp = Bitmap::FromFile(full.c_str());
+            if (bmp && bmp->GetLastStatus() == Ok) {
+                g_assets.emplace_back(name, bmp);
+                std::wstring msg = L"Found asset: " + it.path().wstring();
+                Log(msg);
+            } else {
+                if (bmp) delete bmp;
+                Log(L"Failed to load asset: " + it.path().wstring());
+            }
         }
     }
 }
 
-// ----------------- WinProc -----------------
+// Save scene in the simple format
+void SaveSceneFile(const fs::path &scenePath) {
+    std::ofstream f(scenePath);
+    if (!f) {
+        Log(L"SaveSceneFile: failed to open " + scenePath.native());
+        return;
+    }
+    f << "{\n  \"id\":\"main\",\n  \"entities\":[\n";
+    for (size_t i=0;i<g_entities.size();++i) {
+        auto &e = g_entities[i];
+        f << "    { \"id\":\"" << e.id << "\", \"asset\":\"" << e.asset << "\", \"x\":" << e.x << ", \"y\":" << e.y << ", \"z\":" << e.z << " }";
+        if (i+1<g_entities.size()) f << ",";
+        f << "\n";
+    }
+    f << "  ],\n  \"script\":[]\n}\n";
+    f.close();
+    Log(L"Saved scene: " + scenePath.native());
+    g_documentDirty = false;
+}
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+// UI helpers
+RECT GetSceneRect() {
+    RECT r; r.left = leftPanelW; r.top = toolbarH; r.right = g_winW - inspectorW; r.bottom = g_winH - bottomPanelH;
+    return r;
+}
+RECT GetHierarchyRect() {
+    RECT r; r.left = 0; r.top = toolbarH; r.right = leftPanelW; r.bottom = g_winH - bottomPanelH;
+    return r;
+}
+RECT GetInspectorRect() {
+    RECT r; r.left = g_winW - inspectorW; r.top = toolbarH; r.right = g_winW; r.bottom = g_winH - bottomPanelH;
+    return r;
+}
+RECT GetBottomRect() {
+    RECT r; r.left = 0; r.top = g_winH - bottomPanelH; r.right = g_winW - inspectorW; r.bottom = g_winH;
+    return r;
+}
+
+// Update the three edit boxes from selection
+void UpdateInspectorFields() {
+    if (!hEditX || !hEditY || !hEditZ) return;
+    if (g_selectedIndex >= 0 && g_selectedIndex < (int)g_entities.size()) {
+        Entity &e = g_entities[g_selectedIndex];
+        std::wstring sx = std::to_wstring(e.x);
+        std::wstring sy = std::to_wstring(e.y);
+        std::wstring sz = std::to_wstring(e.z);
+        SetWindowTextW(hEditX, sx.c_str());
+        SetWindowTextW(hEditY, sy.c_str());
+        SetWindowTextW(hEditZ, sz.c_str());
+    } else {
+        SetWindowTextW(hEditX, L"");
+        SetWindowTextW(hEditY, L"");
+        SetWindowTextW(hEditZ, L"");
+    }
+}
+
+// Hit test: returns topmost entity index under point px,py (scene coords)
+int HitTestEntity(int px, int py) {
+    // scene rect offset
+    RECT srect = GetSceneRect();
+    int sx = srect.left, sy = srect.top;
+    for (int i=(int)g_entities.size()-1;i>=0;--i) {
+        Entity &e = g_entities[i];
+        int ex = sx + e.x;
+        int ey = sy + e.y;
+        int ew = e.w;
+        int eh = e.h;
+        if (px >= ex && px <= ex + ew && py >= ey && py <= ey + eh) return i;
+    }
+    return -1;
+}
+
+// apply values from edit boxes to selected entity
+void ApplyInspectorToEntity() {
+    if (g_selectedIndex < 0 || g_selectedIndex >= (int)g_entities.size()) return;
+    wchar_t buf[64];
+    GetWindowTextW(hEditX, buf, 64);
+    int nx= g_entities[g_selectedIndex].x;
+    try { nx = std::stoi(ws2s(std::wstring(buf))); } catch(...) {}
+    GetWindowTextW(hEditY, buf, 64);
+    int ny = g_entities[g_selectedIndex].y;
+    try { ny = std::stoi(ws2s(std::wstring(buf))); } catch(...) {}
+    GetWindowTextW(hEditZ, buf, 64);
+    int nz = g_entities[g_selectedIndex].z;
+    try { nz = std::stoi(ws2s(std::wstring(buf))); } catch(...) {}
+    g_entities[g_selectedIndex].x = nx;
+    g_entities[g_selectedIndex].y = ny;
+    g_entities[g_selectedIndex].z = nz;
+    g_documentDirty = true;
+    RepaintWindow();
+}
+
+// Launch runtime
+void LaunchRuntime() {
+    fs::path exe = fs::path(g_exeFolder) / "ThunderzRuntime.exe";
+    if (!fs::exists(exe)) {
+        Log(L"Runtime exe not found: " + exe.native());
+        return;
+    }
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    std::wstring cmd = exe.wstring();
+    if (CreateProcessW(cmd.c_str(), NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        Log(L"Launched runtime: " + exe.native());
+    } else {
+        Log(L"CreateProcess failed for runtime.");
+    }
+}
+
+// Drawing
+void PaintScene(Gdiplus::Graphics &g) {
+    RECT r = GetSceneRect();
+    int sx = r.left, sy = r.top;
+    // background checkerboard
+    SolidBrush bgBrush(Color(0xFF, 0x2e,0x2f,0x33)); // dark
+    g.FillRectangle(&bgBrush, (REAL)r.left, (REAL)r.top, (REAL)(r.right-r.left), (REAL)(r.bottom-r.top));
+    // grid lines
+    Pen gridPen(Color(60,80,90,100));
+    int grid = 32;
+    for (int x = r.left; x < r.right; x+=grid) g.DrawLine(&gridPen, (REAL)x, (REAL)r.top, (REAL)x, (REAL)r.bottom);
+    for (int y = r.top; y < r.bottom; y+=grid) g.DrawLine(&gridPen, (REAL)r.left, (REAL)y, (REAL)r.right, (REAL)y);
+    // draw entities sorted by z (ascending)
+    std::vector<int> order;
+    for (size_t i=0;i<g_entities.size();++i) order.push_back((int)i);
+    std::sort(order.begin(), order.end(), [&](int a, int b){
+        if (g_entities[a].z == g_entities[b].z) return a < b;
+        return g_entities[a].z < g_entities[b].z;
+    });
+    for (int idx : order) {
+        Entity &e = g_entities[idx];
+        int ex = sx + e.x;
+        int ey = sy + e.y;
+        if (e.bmp) {
+            g.DrawImage(e.bmp, ex, ey, e.w, e.h);
+        } else {
+            SolidBrush b(Color(0xFF, 0xC9,0x55,0x55));
+            g.FillRectangle(&b, (REAL)ex, (REAL)ey, (REAL)48, (REAL)48);
+            FontFamily fontFamily(L"Arial");
+            Gdiplus::Font font(&fontFamily, 10, FontStyleRegular, UnitPixel);
+            SolidBrush tb(Color::White);
+            std::wstring label = s2ws(e.id.empty() ? "entity" : e.id);
+            g.DrawString(label.c_str(), -1, &font, PointF((REAL)ex+6,(REAL)ey+12), &tb);
+        }
+        // draw small label in red on top-left of scene (entity id)
+        if (idx == g_selectedIndex) {
+            Pen sel(Color::Red);
+            sel.SetWidth(2.0f);
+            g.DrawRectangle(&sel, (REAL)ex-2, (REAL)ey-2, (REAL)e.w+4, (REAL)e.h+4);
+        }
+    }
+}
+
+// repaint wrapper
+void RepaintWindow() {
+    if (g_hWnd) InvalidateRect(g_hWnd, NULL, TRUE);
+}
+
+// WndProc
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_CREATE:
+    case WM_CREATE: {
+        g_hWnd = hwnd;
+        // create inspector edit controls within inspector rect
+        RECT ir = GetInspectorRect();
+        int ix = ir.left + 12, iy = ir.top + 24;
+        // create labels via Draw in WM_PAINT, create controls
+        hEditX = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                 ix, iy, 80, 24, hwnd, (HMENU)1001, g_hInst, NULL);
+        hEditY = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                 ix+92, iy, 80, 24, hwnd, (HMENU)1002, g_hInst, NULL);
+        hEditZ = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                 ix+184, iy, 80, 24, hwnd, (HMENU)1003, g_hInst, NULL);
+        hBtnApply = CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                  ix+276, iy, 64, 24, hwnd, (HMENU)2001, g_hInst, NULL);
+        UpdateInspectorFields();
         return 0;
-    case WM_SIZE:
-        winW = LOWORD(lParam); winH = HIWORD(lParam);
-        InvalidateRect(hWnd, NULL, TRUE);
-        return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        PaintAll(hdc);
-        EndPaint(hWnd, &ps);
+    }
+    case WM_SIZE: {
+        g_winW = LOWORD(lParam);
+        g_winH = HIWORD(lParam);
+        RepaintWindow();
         return 0;
     }
     case WM_LBUTTONDOWN: {
         int mx = GET_X_LPARAM(lParam);
         int my = GET_Y_LPARAM(lParam);
-        OnLButtonDown(mx, my);
+        // click inside scene?
+        RECT srect = GetSceneRect();
+        if (mx >= srect.left && mx < srect.right && my >= srect.top && my < srect.bottom) {
+            int idx = HitTestEntity(mx, my);
+            if (idx >= 0) {
+                g_selectedIndex = idx;
+                g_isDragging = true;
+                g_dragIndex = idx;
+                g_dragOffsetX = mx - (srect.left + g_entities[idx].x);
+                g_dragOffsetY = my - (srect.top + g_entities[idx].y);
+                SetCapture(hwnd);
+                UpdateInspectorFields();
+                RepaintWindow();
+            } else {
+                g_selectedIndex = -1;
+                UpdateInspectorFields();
+                RepaintWindow();
+            }
+        } else {
+            // check click on hierarchy (left panel) — simple hit by items
+            RECT hrect = GetHierarchyRect();
+            if (mx >= hrect.left && mx < hrect.right && my >= hrect.top && my < hrect.bottom) {
+                // compute clicked index in list
+                int itemH = 28;
+                int relY = my - hrect.top - 20;
+                if (relY >= 0) {
+                    int idx = relY / itemH;
+                    if (idx >= 0 && idx < (int)g_entities.size()) {
+                        g_selectedIndex = idx;
+                        UpdateInspectorFields();
+                        RepaintWindow();
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (g_isDragging && g_dragIndex >= 0) {
+            int mx = GET_X_LPARAM(lParam);
+            int my = GET_Y_LPARAM(lParam);
+            RECT srect = GetSceneRect();
+            int nx = mx - srect.left - g_dragOffsetX;
+            int ny = my - srect.top - g_dragOffsetY;
+            g_entities[g_dragIndex].x = nx;
+            g_entities[g_dragIndex].y = ny;
+            g_documentDirty = true;
+            UpdateInspectorFields();
+            RepaintWindow();
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (g_isDragging) {
+            g_isDragging = false;
+            g_dragIndex = -1;
+            ReleaseCapture();
+        }
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+        if (id == 2001 && code == BN_CLICKED) {
+            // Apply button
+            ApplyInspectorToEntity();
+            return 0;
+        }
+        if ((id == 1001 || id == 1002 || id == 1003) && code == EN_KILLFOCUS) {
+            // editing finished -> immediate apply
+            ApplyInspectorToEntity();
+            return 0;
+        }
         return 0;
     }
     case WM_KEYDOWN: {
-        if (wParam == 'S') { SaveScene(); AppendLog("Saved via S"); InvalidateRect(hWnd, NULL, TRUE); }
+        if (wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            // Ctrl+S
+            SaveScene();
+            return 0;
+        }
         if (wParam == 'P') {
-            // launch runtime next to EXE if exists
-            std::wstring rt = exeFolder + L"\\ThunderzRuntime.exe";
-            STARTUPINFOW si = {}; si.cb = sizeof(si);
-            PROCESS_INFORMATION pi = {};
-            std::wstring cmd = L"\"" + rt + L"\" \"" + projectPath + L"\"";
-            if (CreateProcessW(rt.c_str(), (LPWSTR)cmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-                AppendLog("Launched runtime: " + WToUtf8(rt));
-            } else {
-                AppendLog("Failed to launch runtime: " + WToUtf8(rt));
-            }
+            LaunchRuntime();
+            return 0;
+        }
+        if (wParam == VK_F5) {
+            LaunchRuntime();
+            return 0;
         }
         return 0;
     }
-    case WM_DESTROY:
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        Graphics g(hdc);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        // Clear whole background
+        SolidBrush appBg(Color(0xFF, 0x2B, 0x2C, 0x31));
+        g.FillRectangle(&appBg, 0, 0, g_winW, g_winH);
+        // Toolbar
+        SolidBrush tb(Color(0xFF,0x28,0x2C,0x32));
+        g.FillRectangle(&tb, 0, 0, g_winW, toolbarH);
+        FontFamily ff(L"Segoe UI");
+        Font font(&ff, 14, FontStyleRegular, UnitPixel);
+        SolidBrush white(Color::White);
+        g.DrawString(L"Thunderz Engine - Editor", -1, &font, PointF(8,12), &white);
+        // draw Save and Play buttons visually (functionality via keys and controls)
+        // left panel (hierarchy)
+        RECT hrect = GetHierarchyRect();
+        SolidBrush leftBg(Color(0xFF, 0x22,0x23,0x27));
+        g.FillRectangle(&leftBg, (REAL)hrect.left, (REAL)hrect.top, (REAL)(hrect.right-hrect.left), (REAL)(hrect.bottom-hrect.top));
+        // draw list of entities
+        Font fontSmall(&ff, 12, FontStyleRegular, UnitPixel);
+        SolidBrush itemSel(Color(0xFF,0x33,0x3A,0x4B));
+        SolidBrush itemTxt(Color(0xFF,0xDD,0xDD,0xDD));
+        int itemY = hrect.top + 20;
+        int itemH = 28;
+        g.DrawString(L"Hierarchy", -1, &fontSmall, PointF((REAL)hrect.left+8, (REAL)(hrect.top+4)), &itemTxt);
+        for (size_t i=0;i<g_entities.size();++i) {
+            RECT ir = {hrect.left+6, itemY, hrect.right-6, itemY + itemH};
+            if ((int)i == g_selectedIndex) {
+                g.FillRectangle(&itemSel, (REAL)ir.left, (REAL)ir.top, (REAL)(ir.right-ir.left), (REAL)(ir.bottom-ir.top));
+            }
+            std::wstring label = s2ws(g_entities[i].id.empty() ? "entity" : g_entities[i].id);
+            g.DrawString(label.c_str(), -1, &fontSmall, PointF((REAL)ir.left+6,(REAL)ir.top+6), &white);
+            itemY += itemH;
+        }
+        // scene
+        PaintScene(g);
+        // inspector right
+        RECT ir = GetInspectorRect();
+        SolidBrush inspBg(Color(0xFF,0x18,0x19,0x1C));
+        g.FillRectangle(&inspBg, (REAL)ir.left, (REAL)ir.top, (REAL)(ir.right-ir.left), (REAL)(ir.bottom-ir.top));
+        g.DrawString(L"Inspector", -1, &fontSmall, PointF((REAL)ir.left+8,(REAL)ir.top+6), &itemTxt);
+        // draw labels for X Y Z near the edit controls (we placed them at WM_CREATE)
+        g.DrawString(L"X:", -1, &fontSmall, PointF((REAL)ir.left+8,(REAL)ir.top+30), &itemTxt);
+        g.DrawString(L"Y:", -1, &fontSmall, PointF((REAL)ir.left+100,(REAL)ir.top+30), &itemTxt);
+        g.DrawString(L"Z:", -1, &fontSmall, PointF((REAL)ir.left+192,(REAL)ir.top+30), &itemTxt);
+        // bottom assets area
+        RECT brect = GetBottomRect();
+        SolidBrush bbg(Color(0xFF,0x16,0x17,0x1A));
+        g.FillRectangle(&bbg, (REAL)brect.left, (REAL)brect.top, (REAL)(brect.right-brect.left), (REAL)(brect.bottom-brect.top));
+        g.DrawString(L"Assets", -1, &fontSmall, PointF((REAL)brect.left+8,(REAL)brect.top+6), &itemTxt);
+        // draw thumbnails
+        int tx = brect.left + 8;
+        int ty = brect.top + 30;
+        for (auto &p : g_assets) {
+            Bitmap* bm = p.second;
+            if (!bm) continue;
+            int thumb = 64;
+            g.DrawImage(bm, tx, ty, thumb, thumb);
+            std::wstring nm = s2ws(p.first);
+            g.DrawString(nm.c_str(), -1, &fontSmall, PointF((REAL)tx+4,(REAL)ty+thumb+4), &itemTxt);
+            tx += thumb + 12;
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY: {
         PostQuitMessage(0);
         return 0;
-    default:
-        return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// ----------------- Init & main -----------------
+// Save helper triggered by Ctrl+S or Save control
+void SaveScene() {
+    fs::path scenePath = fs::path(g_projectPath) / "scenes" / "main.scene";
+    SaveSceneFile(scenePath);
+}
 
-int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
-    // clear & init log
-    {
-        std::ofstream f("editor.log", std::ios::trunc);
-        f << CurrentTimestamp() << " - --- Thunderz Editor (debug) startup ---\n";
+// Reads config.txt
+void ReadConfig() {
+    fs::path cfg = fs::path(g_exeFolder) / "config.txt";
+    if (!fs::exists(cfg)) {
+        Log(L"config.txt missing in exe folder.");
+        return;
     }
-
-    exeFolder = GetExeFolder();
-    AppendLog("EXE folder: " + WToUtf8(exeFolder));
-    // read config.txt
-    std::wstring cfg = exeFolder + L"\\config.txt";
-    std::string content;
-    if (ReadFileUtf8(cfg, content)) {
-        AppendLog("Read config: " + content.substr(0, std::min<size_t>(content.size(), 1024)));
-
-        // parse project_path line robustly and sanitize it
-        std::istringstream iss(content);
-        std::string line;
-        while (std::getline(iss, line)) {
-            // remove any trailing CR leftover from CRLF (common on Windows)
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-
-            const std::string prefix = "project_path=";
-            if (line.rfind(prefix, 0) == 0) {
-                std::string val = line.substr(prefix.size());
-
-                // Trim leading/trailing whitespace and remove control chars
-                auto is_control = [](char c){
-                    return (c=='\r' || c=='\n' || c=='\t' || c==0);
-                };
-                // trim front
-                size_t start = 0;
-                while (start < val.size() && isspace((unsigned char)val[start])) ++start;
-                // trim back and control chars
-                size_t end = val.size();
-                while (end > start && (isspace((unsigned char)val[end-1]) || is_control(val[end-1]))) --end;
-                std::string clean = val.substr(start, end - start);
-
-                // Also remove any stray internal CR/LF characters (defensive)
-                clean.erase(std::remove_if(clean.begin(), clean.end(), [](char c){
-                    return c == '\r' || c == '\n' || c == '\t';
-                }), clean.end());
-
-                // convert UTF-8 -> wstring
-                projectPath = Utf8ToW(clean);
-
-                // Final sanitize of wide string: remove control wchar_t values
-                projectPath.erase(std::remove_if(projectPath.begin(), projectPath.end(), [](wchar_t c){
-                    return c == L'\r' || c == L'\n' || c == L'\t' || c == 0;
-                }), projectPath.end());
-
-                AppendLog("Resolved project path: " + WToUtf8(projectPath));
-                break;
-            }
+    std::ifstream f(cfg);
+    std::string line;
+    while (std::getline(f, line)) {
+        // trim
+        while (!line.empty() && (line.back()=='\r' || line.back()=='\n')) line.pop_back();
+        if (line.rfind("project_path=",0) == 0) {
+            std::string val = line.substr(strlen("project_path="));
+            // convert to wide path
+            g_projectPath = s2ws(val);
+            Log(L"Read config: project_path=" + g_projectPath);
         }
-    } else {
-        AppendLog("config.txt missing next to exe. Using exeFolder as project path.");
-        projectPath = exeFolder;
     }
+    f.close();
+}
 
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    g_hInst = hInstance;
+    // clear log
+    std::wofstream fl("editor.log");
+    fl << L"";
+    fl.close();
+    // determine exe folder
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(NULL, buf, MAX_PATH);
+    fs::path exePath = fs::path(buf);
+    g_exeFolder = exePath.parent_path().wstring();
+    Log(L"--- Thunderz Editor (debug) startup ---");
+    Log(L"EXE folder: " + g_exeFolder);
+    // read config.txt
+    ReadConfig();
+    if (g_projectPath.empty()) {
+        Log(L"No project path in config.txt. Please set project_path=...");
+    }
     // init GDI+
-    GdiplusStartupInput gsi;
-    if (GdiplusStartup(&gdiToken, &gsi, NULL) != Ok) {
-        MessageBoxW(NULL, L"Gdiplus failed to initialize", L"Error", MB_ICONERROR);
-        return 1;
-    }
-    gdiInited = true;
-    AppendLog("GDI+ initialized");
-
-    // scan/load project
-    ScanAssetsFolder();
-    LoadBitmaps();
-    ParseScene();
-
-    // register windows class
-    const wchar_t CLASS_NAME[] = L"ThunderzEditorClass";
+    ULONG_PTR gdiplusToken;
+    GdiplusStartupInput gdiplusStartupInput;
+    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    Log(L"GDI+ initialized");
+    // scan assets
+    ScanAssets();
+    // load scene
+    fs::path scenePath = fs::path(g_projectPath) / "scenes" / "main.scene";
+    LoadSceneFile(scenePath);
+    // window class
+    const wchar_t CLASS_NAME[] = L"ThunderzEditorWindowClass";
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
-
-    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"Thunderz Editor", WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL, NULL, hInstance, NULL);
-    if (!hwnd) { AppendLog("CreateWindowExW failed"); return 1; }
-    hwndGlobal = hwnd;
-
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
-
-    // main loop
+    // create window
+    g_hWnd = CreateWindowExW(0, CLASS_NAME, L"Thunderz Editor", WS_OVERLAPPEDWINDOW,
+                             CW_USEDEFAULT, CW_USEDEFAULT, g_winW, g_winH,
+                             NULL, NULL, hInstance, NULL);
+    if (!g_hWnd) {
+        Log(L"CreateWindowEx failed");
+        return 0;
+    }
+    ShowWindow(g_hWnd, nCmdShow);
+    UpdateWindow(g_hWnd);
+    // message loop
     MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+    while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-
-    // cleanup
-    for (auto &a: assets) if (a.bmp) { delete a.bmp; a.bmp=nullptr; }
-    if (gdiInited) GdiplusShutdown(gdiToken);
-
-    AppendLog("Editor exiting");
-    return 0;
+    // cleanup assets
+    for (auto &p : g_assets) { if (p.second) delete p.second; }
+    GdiplusShutdown(gdiplusToken);
+    return (int)msg.wParam;
 }
 
 
