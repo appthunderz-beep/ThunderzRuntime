@@ -1,6 +1,6 @@
 // ThunderzEditor.cpp
-// Full editor file — drop-in replacement for your existing editor source.
-// Build: g++ -std=c++17 -municode -lgdiplus ThunderzEditor.cpp -o ThunderzEditor.exe
+// Fixed version — use as drop-in replacement.
+// Build: g++ -std=c++17 -municode -lgdiplus -lshlwapi ThunderzEditor.cpp -o ThunderzEditor.exe
 
 #define UNICODE
 #define _UNICODE
@@ -39,11 +39,11 @@ static std::wstring g_logPath;
 
 static void AppendLog(const std::wstring &s) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    std::wofstream f(g_logPath, std::ios::app);
+    std::wofstream f(g_logPath.c_str(), std::ios::app);
     if (f) {
         SYSTEMTIME st; GetLocalTime(&st);
-        wchar_t buf[200];
-        swprintf(buf, 200, L"%04d-%02d-%02d %02d:%02d:%02d - %s\n",
+        wchar_t buf[300];
+        swprintf(buf, 300, L"%04d-%02d-%02d %02d:%02d:%02d - %s\n",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, s.c_str());
         f << buf;
     }
@@ -81,13 +81,13 @@ static int g_dragEntityIndex = -1;
 static POINT g_lastMousePt = {0,0};
 
 // ---------- Forward declarations ----------
-void EnsureBackBuffer(int w, int h);
-void PaintEditor(HWND hwnd);
-void DrawEditorContents(Gdiplus::Graphics &g, int w, int h);
-void ScanProjectAssets();
-bool LoadSceneFile();
-bool SaveSceneFile();
-void LaunchRuntimeIfNotRunning(HWND hwnd);
+static void EnsureBackBuffer(int w, int h);
+static void PaintEditor(HWND hwnd);
+static void DrawEditorContents(Gdiplus::Graphics &g, int w, int h);
+static void ScanProjectAssets();
+static bool LoadSceneFile();
+static bool SaveSceneFile();
+static void LaunchRuntimeIfNotRunning(HWND hwnd);
 
 // ---------- Utilities ----------
 static std::string WToA(const std::wstring &ws) {
@@ -116,15 +116,12 @@ static std::string ReadFileToString(const std::string &path) {
 }
 
 // ---------- VERY simple JSON parser for our small scene format ----------
-// Not a full JSON parser — only handles the simple scene format you use.
-// Expected structure (whitespace tolerant): {"id":"main","entities":[{...},{...}],"script":[]}
 static bool parse_scene_simple(const std::string &json, std::string &out_id, std::vector<Entity> &out_entities) {
     out_entities.clear();
     out_id.clear();
     size_t i=0, n=json.size();
     auto skip = [&](void){ while(i<n && isspace((unsigned char)json[i])) ++i; };
     skip();
-    // find "id"
     size_t idpos = json.find("\"id\"", i);
     if (idpos==std::string::npos) return false;
     size_t colon = json.find(':', idpos);
@@ -135,22 +132,19 @@ static bool parse_scene_simple(const std::string &json, std::string &out_id, std
     if (q2==std::string::npos) return false;
     out_id = json.substr(q1+1, q2-q1-1);
 
-    // find entities array
     size_t entitiesPos = json.find("\"entities\"", q2);
-    if (entitiesPos==std::string::npos) return true; // okay if none
+    if (entitiesPos==std::string::npos) return true;
     size_t arrOpen = json.find('[', entitiesPos);
     if (arrOpen==std::string::npos) return false;
     size_t arrClose = json.find(']', arrOpen);
     if (arrClose==std::string::npos) return false;
     size_t p = arrOpen+1;
     while (p < arrClose) {
-        // find next { ... }
         size_t objOpen = json.find('{', p);
         if (objOpen==std::string::npos || objOpen>=arrClose) break;
         size_t objClose = json.find('}', objOpen);
         if (objClose==std::string::npos || objClose>arrClose) break;
         std::string obj = json.substr(objOpen+1, objClose-objOpen-1);
-        // parse fields id, asset, x, y, z
         Entity e;
         auto get_str = [&](const char* key)->std::string {
             size_t kp = obj.find(std::string("\"") + key + "\"");
@@ -189,7 +183,6 @@ static bool parse_scene_simple(const std::string &json, std::string &out_id, std
     return true;
 }
 
-// write scene simple
 static std::string write_scene_simple(const std::string &id, const std::vector<Entity> &entities) {
     std::ostringstream ss;
     ss << "{\n  \"id\": \"" << id << "\",\n  \"entities\": [\n";
@@ -209,26 +202,25 @@ static void ScanProjectAssets() {
     g_assets.clear();
     if (g_projectPath.empty()) return;
     fs::path assetsFolder = fs::path(g_projectPath) / "assets";
-    AppendLog(L"Scanning assets in: " + assetsFolder.wstring());
+    AppendLog(std::wstring(L"Scanning assets in: ") + assetsFolder.wstring());
     if (!fs::exists(assetsFolder)) return;
     for (auto &p : fs::directory_iterator(assetsFolder)) {
         if (!p.is_regular_file()) continue;
         Asset a;
         a.name = p.path().filename().string();
-        // we won't load full bitmap sizes with GDI+ here — do when needed
         g_assets.push_back(a);
-        AppendLog(AToW(std::string(L"Found asset: ") + p.path().filename().wstring()));
+        AppendLog(std::wstring(L"Found asset: ") + p.path().filename().wstring());
     }
 }
 
 // ---------- Scene load/save ----------
-bool LoadSceneFile() {
+static bool LoadSceneFile() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_projectPath.empty()) return false;
     fs::path scenePath = fs::path(g_projectPath) / "scenes" / "main.scene";
-    AppendLog(L"Loading scene from: " + scenePath.wstring());
+    AppendLog(std::wstring(L"Loading scene from: ") + scenePath.wstring());
     if (!fs::exists(scenePath)) {
-        AppendLog(L"Scene missing: " + scenePath.wstring());
+        AppendLog(std::wstring(L"Scene missing: ") + scenePath.wstring());
         return false;
     }
     std::string content = ReadFileToString(scenePath.string());
@@ -244,11 +236,11 @@ bool LoadSceneFile() {
     }
     g_entities = ent;
     g_sceneId = id.empty() ? "main" : id;
-    AppendLog(L"Loaded entities count: " + std::to_wstring(g_entities.size()));
+    AppendLog(std::wstring(L"Loaded entities count: ") + std::to_wstring(g_entities.size()));
     return true;
 }
 
-bool SaveSceneFile() {
+static bool SaveSceneFile() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_projectPath.empty()) return false;
     fs::path sceneDir = fs::path(g_projectPath) / "scenes";
@@ -266,7 +258,7 @@ bool SaveSceneFile() {
 }
 
 // ---------- GDI+ back buffer ----------
-void EnsureBackBuffer(int w, int h) {
+static void EnsureBackBuffer(int w, int h) {
     if (w<=0 || h<=0) return;
     if (!g_backBuffer || g_backW!=w || g_backH!=h) {
         if (g_backBuffer) delete g_backBuffer;
@@ -278,78 +270,67 @@ void EnsureBackBuffer(int w, int h) {
 // ---------- Draw helpers ----------
 static Gdiplus::Color color_from_rgb(int r,int g,int b){ return Gdiplus::Color(255,r,g,b); }
 
-void DrawEntityPreview(Gdiplus::Graphics &g, const Entity &e) {
-    // Draw a simple box with name
+static void DrawEntityPreview(Gdiplus::Graphics &g, const Entity &e) {
     Gdiplus::SolidBrush brush(color_from_rgb(210,100,100));
     Gdiplus::Pen pen(color_from_rgb(160,60,60), 2.0f);
-    Gdiplus::REAL w=48,h=48;
-    g.FillRectangle(&brush, (REAL)e.x, (REAL)e.y, w, h);
-    g.DrawRectangle(&pen, (REAL)e.x, (REAL)e.y, w, h);
+    float w=48.0f, h=48.0f;
+    g.FillRectangle(&brush, (Gdiplus::REAL)e.x, (Gdiplus::REAL)e.y, w, h);
+    g.DrawRectangle(&pen, (Gdiplus::REAL)e.x, (Gdiplus::REAL)e.y, w, h);
 
-    // draw id text
     Gdiplus::FontFamily ff(L"Segoe UI");
     Gdiplus::Font font(&ff, 9, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush tb(color_from_rgb(255,255,255));
     Gdiplus::StringFormat sf; sf.SetAlignment(Gdiplus::StringAlignmentCenter);
-    Gdiplus::RectF rect((REAL)e.x, (REAL)e.y+8, w, 32);
+    Gdiplus::RectF rect((Gdiplus::REAL)e.x, (Gdiplus::REAL)e.y+8.0f, w, 32.0f);
     std::wstring idw = AToW(e.id);
     g.DrawString(idw.c_str(), -1, &font, rect, &sf, &tb);
 }
 
-void DrawGrid(Gdiplus::Graphics &g, int w, int h) {
+static void DrawGrid(Gdiplus::Graphics &g, int w, int h) {
     const int step = 32;
     Gdiplus::Pen pen(color_from_rgb(60,60,70), 1.0f);
     pen.SetDashStyle(Gdiplus::DashStyleSolid);
-    for (int x=0;x<w;x+=step) g.DrawLine(&pen, (REAL)x, 0.0f, (REAL)x, (REAL)h);
-    for (int y=0;y<h;y+=step) g.DrawLine(&pen, 0.0f, (REAL)y, (REAL)w, (REAL)y);
+    for (int x=0;x<w;x+=step) g.DrawLine(&pen, (Gdiplus::REAL)x, 0.0f, (Gdiplus::REAL)x, (Gdiplus::REAL)h);
+    for (int y=0;y<h;y+=step) g.DrawLine(&pen, 0.0f, (Gdiplus::REAL)y, (Gdiplus::REAL)w, (Gdiplus::REAL)y);
 }
 
-// Inspector drawing
-void DrawInspector(Gdiplus::Graphics &g, int left, int top, int w, int h) {
+static void DrawInspector(Gdiplus::Graphics &g, int left, int top, int w, int h) {
     Gdiplus::SolidBrush tbrush(color_from_rgb(220,220,220));
     Gdiplus::FontFamily ff(L"Segoe UI");
     Gdiplus::Font font(&ff, 11, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     int y = top + 10;
-    g.DrawString(L"Inspector", -1, &font, Gdiplus::PointF((REAL)left,(REAL)y), &tbrush);
+    g.DrawString(L"Inspector", -1, &font, Gdiplus::PointF((Gdiplus::REAL)left,(Gdiplus::REAL)y), &tbrush);
     y += 30;
 
-    // Show selected first by index 0 if exists
     int sel = -1;
-    if (!g_entities.empty()) sel=0; // editor does not maintain selection index sufficiently here; you can enhance
+    if (!g_entities.empty()) sel=0;
     if (sel>=0 && sel < (int)g_entities.size()) {
         Entity &e = g_entities[sel];
         std::wstring s = AToW(e.id);
-        g.DrawString(s.c_str(), -1, &font, Gdiplus::PointF((REAL)left, (REAL)y), &tbrush);
+        g.DrawString(s.c_str(), -1, &font, Gdiplus::PointF((Gdiplus::REAL)left, (Gdiplus::REAL)y), &tbrush);
         y += 24;
-        // labels X Y Z
         Gdiplus::Font fsmall(&ff, 10, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-        g.DrawString(L"X:", -1, &fsmall, Gdiplus::PointF((REAL)left, (REAL)y), &tbrush);
-        g.DrawString(L"Y:", -1, &fsmall, Gdiplus::PointF((REAL)left+80, (REAL)y), &tbrush);
-        g.DrawString(L"Z:", -1, &fsmall, Gdiplus::PointF((REAL)left+160, (REAL)y), &tbrush);
-        // values
+        g.DrawString(L"X:", -1, &fsmall, Gdiplus::PointF((Gdiplus::REAL)left, (Gdiplus::REAL)y), &tbrush);
+        g.DrawString(L"Y:", -1, &fsmall, Gdiplus::PointF((Gdiplus::REAL)left+80.0f, (Gdiplus::REAL)y), &tbrush);
+        g.DrawString(L"Z:", -1, &fsmall, Gdiplus::PointF((Gdiplus::REAL)left+160.0f, (Gdiplus::REAL)y), &tbrush);
         wchar_t buf[64];
         swprintf(buf, 64, L"%d", e.x);
-        g.DrawString(buf, -1, &fsmall, Gdiplus::PointF((REAL)left+24, (REAL)y), &tbrush);
+        g.DrawString(buf, -1, &fsmall, Gdiplus::PointF((Gdiplus::REAL)left+24.0f, (Gdiplus::REAL)y), &tbrush);
         swprintf(buf, 64, L"%d", e.y);
-        g.DrawString(buf, -1, &fsmall, Gdiplus::PointF((REAL)left+104, (REAL)y), &tbrush);
+        g.DrawString(buf, -1, &fsmall, Gdiplus::PointF((Gdiplus::REAL)left+104.0f, (Gdiplus::REAL)y), &tbrush);
         swprintf(buf, 64, L"%d", e.z);
-        g.DrawString(buf, -1, &fsmall, Gdiplus::PointF((REAL)left+184, (REAL)y), &tbrush);
+        g.DrawString(buf, -1, &fsmall, Gdiplus::PointF((Gdiplus::REAL)left+184.0f, (Gdiplus::REAL)y), &tbrush);
     }
 }
 
-// The main draw call — draws left hierarchy, scene center, inspector right, bottom assets
-void DrawEditorContents(Gdiplus::Graphics &g, int w, int h) {
-    // background
+static void DrawEditorContents(Gdiplus::Graphics &g, int w, int h) {
     g.Clear(color_from_rgb(38,40,44));
-
-    // layout
     const int leftW = 200;
     const int rightW = 260;
     const int bottomH = 120;
     int sceneW = w - leftW - rightW;
     int sceneH = h - bottomH;
 
-    // left panel (hierarchy)
     Gdiplus::SolidBrush panel(color_from_rgb(30,32,36));
     g.FillRectangle(&panel, 0, 0, leftW, h);
     Gdiplus::FontFamily ff(L"Segoe UI");
@@ -357,58 +338,51 @@ void DrawEditorContents(Gdiplus::Graphics &g, int w, int h) {
     Gdiplus::SolidBrush text(color_from_rgb(200,200,200));
     g.DrawString(L"Hierarchy", -1, &font, Gdiplus::PointF(10,8), &text);
 
-    // bottom assets panel
     g.FillRectangle(&panel, leftW, h-bottomH, sceneW, bottomH);
     g.DrawString(L"Assets", -1, &font, Gdiplus::PointF(10,h-bottomH+6), &text);
 
-    // inspector right
     g.FillRectangle(&panel, leftW+sceneW, 0, rightW, h);
     DrawInspector(g, leftW+sceneW+8, 8, rightW-16, h-16);
 
-    // scene area
     Gdiplus::SolidBrush sceneBg(color_from_rgb(60,64,73));
     g.FillRectangle(&sceneBg, leftW, 0, sceneW, sceneH);
     DrawGrid(g, sceneW, sceneH);
 
-    // draw entities (center scene coordinates)
     for (size_t i=0;i<g_entities.size();++i) {
         DrawEntityPreview(g, g_entities[i]);
     }
 
-    // draw assets thumbnails in bottom
     int thumbX = leftW+8;
     int thumbY = h-bottomH+36;
     for (size_t i=0;i<g_assets.size();++i) {
         Gdiplus::SolidBrush tb(color_from_rgb(80,150,210));
-        g.FillRectangle(&tb, (REAL)thumbX, (REAL)thumbY, 56.0f, 56.0f);
+        g.FillRectangle(&tb, (Gdiplus::REAL)thumbX, (Gdiplus::REAL)thumbY, 56.0f, 56.0f);
         Gdiplus::Pen p(color_from_rgb(60,110,170), 2.0f);
-        g.DrawRectangle(&p, (REAL)thumbX, (REAL)thumbY, 56.0f, 56.0f);
+        g.DrawRectangle(&p, (Gdiplus::REAL)thumbX, (Gdiplus::REAL)thumbY, 56.0f, 56.0f);
         std::wstring nm = AToW(g_assets[i].name);
         Gdiplus::Font fsmall(&ff, 9, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
         Gdiplus::StringFormat sf; sf.SetAlignment(Gdiplus::StringAlignmentCenter);
-        g.DrawString(nm.c_str(), -1, &fsmall, Gdiplus::RectF((REAL)thumbX, (REAL)thumbY+60, 56.0f, 16.0f), &sf, &text);
+        g.DrawString(nm.c_str(), -1, &fsmall, Gdiplus::RectF((Gdiplus::REAL)thumbX, (Gdiplus::REAL)thumbY+60.0f, 56.0f, 16.0f), &sf, &text);
         thumbX += 72;
     }
 
-    // top bar: Save / Play
     Gdiplus::SolidBrush bar(color_from_rgb(50,50,55));
     g.FillRectangle(&bar, 0, 0, w, 40);
     Gdiplus::SolidBrush green(color_from_rgb(45,145,80));
     Gdiplus::SolidBrush blue(color_from_rgb(60,100,180));
-    g.FillRectangle(&green, 12, 6, 80, 28); // Save
-    g.FillRectangle(&blue, 102, 6, 80, 28); // Play
+    g.FillRectangle(&green, 12, 6, 80, 28);
+    g.FillRectangle(&blue, 102, 6, 80, 28);
 
     Gdiplus::Font fbtn(&ff, 12, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     g.DrawString(L"Save (S)", -1, &fbtn, Gdiplus::PointF(18,10), &text);
     g.DrawString(L"Play (P)", -1, &fbtn, Gdiplus::PointF(112,10), &text);
 
-    // small status
     std::wstring status = g_isPlaying ? L"Runtime: running" : L"Runtime: stopped";
-    g.DrawString(status.c_str(), -1, &font, Gdiplus::PointF((REAL)w-180f,10), &text);
+    g.DrawString(status.c_str(), -1, &font, Gdiplus::PointF((Gdiplus::REAL)w-180.0f,10.0f), &text);
 }
 
 // ---------- Painting (double buffer) ----------
-void PaintEditor(HWND hwnd) {
+static void PaintEditor(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
@@ -428,22 +402,20 @@ void PaintEditor(HWND hwnd) {
 }
 
 // ---------- Runtime launch ----------
-void LaunchRuntimeIfNotRunning(HWND hwnd) {
+static void LaunchRuntimeIfNotRunning(HWND hwnd) {
     if (g_isPlaying.load()) return;
-    // create full exe path
     fs::path exe = fs::path(g_exeFolder) / RUNTIME_EXE_NAME;
     std::wstring exeW = exe.wstring();
     STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
     BOOL ok = CreateProcessW(exeW.c_str(), NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
     if (!ok) {
-        AppendLog(L"Failed to launch runtime: " + exeW);
+        AppendLog(std::wstring(L"Failed to launch runtime: ") + exeW);
         return;
     }
     g_runtimeProc = pi;
     g_isPlaying.store(true);
-    AppendLog(L"Launched runtime: " + exeW);
-    // watcher
+    AppendLog(std::wstring(L"Launched runtime: ") + exeW);
     std::thread([hwnd]() {
         WaitForSingleObject(g_runtimeProc.hProcess, INFINITE);
         CloseHandle(g_runtimeProc.hProcess);
@@ -460,10 +432,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE:
         g_hWnd = hwnd;
         AppendLog(L"--- Thunderz Editor (debug) startup ---");
-        AppendLog(L"EXE folder: " + g_exeFolder);
-        AppendLog(L"Read config: project_path=" + g_projectPath);
-        // init GDI+ is done earlier in main
-        // scan assets + load scene
+        AppendLog(std::wstring(L"EXE folder: ") + g_exeFolder);
+        AppendLog(std::wstring(L"Read config: project_path=") + g_projectPath);
         ScanProjectAssets();
         LoadSceneFile();
         InvalidateRect(hwnd, NULL, FALSE);
@@ -487,7 +457,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int my = GET_Y_LPARAM(lParam);
         g_mouseDown = 1;
         g_lastMousePt.x = mx; g_lastMousePt.y = my;
-        // check entity pick (simple bounding boxes) — pick topmost
         int picked=-1;
         for (int i=(int)g_entities.size()-1;i>=0;--i) {
             Entity &e = g_entities[i];
@@ -517,7 +486,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONUP: {
         g_mouseDown = 0;
         g_dragEntityIndex = -1;
-        // auto-save on drop
         SaveSceneFile();
         g_needsRepaint = true;
         InvalidateRect(hwnd, NULL, FALSE);
@@ -547,7 +515,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_USER+200:
-        // runtime exited notification
         AppendLog(L"Runtime exited");
         g_needsRepaint = true;
         InvalidateRect(hwnd, NULL, FALSE);
@@ -566,17 +533,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 // ---------- Startup: read config and init ----------
 static bool ReadConfig() {
-    // config path: <exeFolder>/config.txt
     fs::path cfg = fs::path(g_exeFolder) / "config.txt";
     g_configPath = cfg.wstring();
-    std::wifstream fi(cfg.wstring());
+    std::wifstream fi(cfg.wstring().c_str());
     if (!fi) {
-        AppendLog(L"Config not found: " + cfg.wstring());
+        AppendLog(std::wstring(L"Config not found: ") + cfg.wstring());
         return false;
     }
     std::wstring line;
     while (std::getline(fi, line)) {
-        // trim
         auto trim = [&](std::wstring &s){ while(!s.empty() && iswspace(s.back())) s.pop_back(); while(!s.empty() && iswspace(s.front())) s.erase(s.begin()); };
         trim(line);
         if (line.rfind(L"project_path=",0)==0) {
@@ -586,30 +551,26 @@ static bool ReadConfig() {
         }
     }
     fi.close();
-    AppendLog(L"Read config: project_path=" + g_projectPath);
+    AppendLog(std::wstring(L"Read config: project_path=") + g_projectPath);
     return true;
 }
 
 // ---------- WinMain ----------
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
-    // determine exe folder
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     fs::path p(exePath);
     g_exeFolder = p.parent_path().wstring();
     g_logPath = (fs::path(g_exeFolder) / "editor.log").wstring();
-    // clear previous log
     {
-        std::wofstream lf(g_logPath, std::ios::trunc);
+        std::wofstream lf(g_logPath.c_str(), std::ios::trunc);
         lf << L"";
     }
     AppendLog(L"--- Thunderz Editor (debug) startup ---");
-    AppendLog(L"EXE folder: " + g_exeFolder);
+    AppendLog(std::wstring(L"EXE folder: ") + g_exeFolder);
 
-    // read config
     ReadConfig();
 
-    // initialize GDI+
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     ULONG_PTR gdiplusToken;
     Gdiplus::Status st = Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
@@ -619,7 +580,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     }
     AppendLog(L"GDI+ initialized");
 
-    // register window class
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -630,7 +590,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.lpszClassName = WINDOW_CLASS;
     RegisterClassExW(&wc);
 
-    // create window
     HWND hwnd = CreateWindowExW(0, WINDOW_CLASS, WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800,
@@ -640,18 +599,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // scan assets/scene initially
     ScanProjectAssets();
     LoadSceneFile();
 
-    // message loop
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    // cleanup
     if (g_backBuffer) delete g_backBuffer;
     Gdiplus::GdiplusShutdown(gdiplusToken);
     AppendLog(L"Editor exiting");
