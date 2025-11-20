@@ -1,6 +1,8 @@
-// ThunderzEditor_debug_patched.cpp - Debug build (GDI+ startup moved before bitmap loads)
-// Replace your ThunderzEditor.cpp with this file. It will create `editor.log` next to the EXE
-// and print exactly what it reads: config, project path, assets found (with sizes), main.scene contents
+// ThunderzEditor.cpp
+// Thunderz Editor - Phase1 UI (Custom modern style)
+// Drop-in replacement for current editor (minimal dependencies).
+// Build with MinGW + GDI+:
+// g++ -static -O2 -std=gnu++17 ThunderzEditor.cpp -o build/ThunderzEditor.exe -lgdiplus -lgdi32 -luser32 -lkernel32 -municode -mwindows
 
 #define UNICODE
 #define _UNICODE
@@ -8,468 +10,619 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <gdiplus.h>
-#include <vector>
 #include <string>
+#include <vector>
 #include <fstream>
 #include <sstream>
-#include <filesystem>
 #include <algorithm>
-#include <chrono>
-#include <iomanip>
+#include <locale>
+#include <codecvt>
+#include <ctime>
 
-using namespace Gdiplus;
-namespace fs = std::filesystem;
 #pragma comment(lib, "gdiplus.lib")
 
-// Window layout
-int winW = 1100, winH = 700;
-int rightPanelW = 300;
-int assetsPanelH = 140;
-int toolbarH = 40;
-ULONG_PTR gToken;
+using namespace Gdiplus;
 
-// Logging
-static std::ofstream gLog;
-void Log(const std::string &s) {
-    if (!gLog.is_open()) return;
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    gLog << std::put_time(std::localtime(&t), "%Y-%m-%d %H:%M:%S") << " - " << s << std::endl;
+// ----------------- Utilities -----------------
+
+static std::string CurrentTimestamp()
+{
+    time_t t = time(nullptr);
+    struct tm tmv;
+    localtime_s(&tmv, &t);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+    return std::string(buf);
 }
 
-// Utilities for wide/narrow conversions
-static std::string ws_to_s(const std::wstring &ws) {
-    if (ws.empty()) return {};
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
-    std::string s(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), s.data(), size_needed, NULL, NULL);
+static void AppendLog(const std::string &s)
+{
+    std::ofstream f("editor.log", std::ios::app);
+    if (f.is_open()) {
+        f << CurrentTimestamp() << " - " << s << "\n";
+    }
+}
+
+static std::wstring Utf8ToW(const std::string &s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
+    std::wstring w; w.resize(n);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+static std::string WToUtf8(const std::wstring &w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
+    std::string s; s.resize(n);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, NULL, NULL);
     return s;
 }
-static std::wstring s_to_ws(const std::string &s) {
-    if (s.empty()) return {};
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
-    std::wstring ws(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), size_needed);
-    return ws;
-}
 
-// ------------------- ENTITY STRUCT -------------------
-struct Entity {
-    std::wstring id;
-    std::wstring assetFilename;
-    int x, y;
-    int w, h;
-    int layer;
+// ----------------- Data -----------------
+
+struct Asset {
+    std::wstring name;
+    std::wstring fullPath;
+    Bitmap *bmp = nullptr;
+    UINT w=0,h=0;
 };
 
-std::vector<Entity> entities;
-std::vector<std::wstring> assetFiles;
-std::vector<Bitmap*> assetImages;
+struct Entity {
+    std::string id;
+    std::wstring asset; // asset filename (wide)
+    int x=0,y=0,z=0;
+    Asset* assetPtr = nullptr;
+};
 
-int selectedAssetIndex = 0;
-int selectedEntity = -1;
+static std::wstring exeFolder;
+static std::wstring projectPath;
+static std::vector<Asset> assets;
+static std::vector<Entity> entities;
+static int selectedEntity = -1;
 
-float viewZoom = 1.0f;
-float viewOffsetX = 0.0f, viewOffsetY = 0.0f;
+// UI layout values (will compute on resize)
+static int winW = 1280, winH = 720;
+static int toolbarH = 44;
+static int leftW = 220;
+static int rightW = 300;
+static int assetsH = 180;
+static HWND hwndGlobal = NULL;
+static ULONG_PTR gdiToken = 0;
+static bool gdiInited = false;
 
-// Paths & config
-std::wstring exeFolder; // absolute folder of EXE
-std::wstring configPath; // absolute config.txt path
-std::wstring projectPath; // absolute project path
-std::wstring assetsDir;   // absolute assets dir
-std::wstring scenesDir;   // absolute scenes dir
-std::wstring mainScenePath; // absolute main.scene
+// ----------------- File helpers -----------------
 
-// default relative project
-std::wstring defaultRelProject = L"Projects\\ExampleProject";
-
-// --------------------- FILE HELPERS ---------------------
-static std::string readAllBytesNarrow(const std::wstring& path) {
-    std::ifstream ifs(ws_to_s(path), std::ios::binary);
-    if (!ifs) return {};
-    std::ostringstream ss; ss << ifs.rdbuf();
-    return ss.str();
+static bool ReadFileUtf8(const std::wstring &path, std::string &out) {
+    std::string p = WToUtf8(path);
+    std::ifstream f(p, std::ios::binary);
+    if (!f.is_open()) return false;
+    std::ostringstream ss; ss<<f.rdbuf();
+    out = ss.str();
+    return true;
+}
+static bool WriteFileUtf8(const std::wstring &path, const std::string &data) {
+    std::string p = WToUtf8(path);
+    std::ofstream f(p, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.write(data.data(), data.size());
+    return true;
 }
 
-// ------------------- LOGGED ASSET SCANNER -------------------
-void ScanAssets() {
-    Log("Scanning assets in: " + ws_to_s(assetsDir));
+static std::wstring GetExeFolder() {
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, buf, MAX_PATH);
+    std::wstring p(buf, buf + n);
+    size_t pos = p.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) p = p.substr(0, pos);
+    return p;
+}
 
-    for (auto b : assetImages) if (b) delete b;
-    assetImages.clear();
-    assetFiles.clear();
+// ----------------- Load project & assets & scene -----------------
 
-    try {
-        if (fs::exists(assetsDir) && fs::is_directory(assetsDir)) {
-            for (auto& p : fs::directory_iterator(assetsDir)) {
-                if (!p.is_regular_file()) continue;
-                auto ext = p.path().extension().wstring();
-                std::transform(ext.begin(), ext.end(), ext.begin(), towlower);
-                if (ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp")
-                    assetFiles.push_back(p.path().wstring());
+static void ScanAssetsFolder() {
+    assets.clear();
+    std::wstring ad = projectPath + L"\\assets";
+    AppendLog("Scanning assets in: " + WToUtf8(ad));
+    std::wstring search = ad + L"\\*.*";
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(search.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring name = fd.cFileName;
+        Asset a; a.name = name; a.fullPath = ad + L"\\" + name;
+        assets.push_back(a);
+        AppendLog("Found asset: " + WToUtf8(name));
+    } while (FindNextFileW(h,&fd));
+    FindClose(h);
+}
+
+static Asset* FindAsset(const std::wstring &name) {
+    for (auto &a: assets) if (a.name==name) return &a;
+    return nullptr;
+}
+
+static void LoadBitmaps() {
+    for (auto &a: assets) {
+        if (a.bmp) { delete a.bmp; a.bmp=nullptr;}
+        Bitmap *b = Bitmap::FromFile(a.fullPath.c_str(), false);
+        if (b) {
+            if (b->GetLastStatus()==Ok) {
+                a.bmp = b; a.w = b->GetWidth(); a.h = b->GetHeight();
+                AppendLog("Loaded bitmap: " + WToUtf8(a.name));
+            } else {
+                delete b;
+                AppendLog("Failed bitmap load (status): " + WToUtf8(a.name));
             }
-        } else {
-            Log("Assets dir missing or not a directory: " + ws_to_s(assetsDir));
-        }
-    } catch (std::exception &e) {
-        Log(std::string("Exception scanning assets: ") + e.what());
+        } else AppendLog("Bitmap null: " + WToUtf8(a.name));
     }
-
-    std::sort(assetFiles.begin(), assetFiles.end());
-
-    for (auto& path : assetFiles) {
-        Bitmap* b = Bitmap::FromFile(path.c_str());
-        if (b && b->GetLastStatus() == Ok) {
-            assetImages.push_back(b);
-            try {
-                auto fsize = fs::file_size(path);
-                Log("Found asset: " + ws_to_s(fs::path(path).filename().wstring()) + " (" + std::to_string((long long)fsize) + " bytes)");
-            } catch (...) {}
-        } else {
-            assetImages.push_back(nullptr);
-            Log("Asset failed to load (bitmap null or bad status): " + ws_to_s(path));
-        }
-    }
-
-    if (selectedAssetIndex >= (int)assetFiles.size())
-        selectedAssetIndex = std::max(0, (int)assetFiles.size() - 1);
 }
 
-// ------------------- SCENE SAVE/LOAD (with logging) -------------------
-void SaveScene() {
-    Log("Saving scene to: " + ws_to_s(mainScenePath));
-    std::wstringstream ss;
-    ss << L"{\n  \"id\": \"main\",\n  \"entities\": [\n";
-    for (size_t i = 0; i < entities.size(); i++) {
-        Entity& e = entities[i];
-        ss << L"    {\"id\":\"" << e.id << L"\",\"asset\":\"" << e.assetFilename << L"\",\"x\":" << e.x
-           << L",\"y\":" << e.y << L",\"w\":" << e.w << L",\"h\":" << e.h << L"}";
-        if (i + 1 < entities.size()) ss << L",";
-        ss << L"\n";
-    }
-    ss << L"  ],\n  \"script\": []\n}\n";
-    std::wstring ws = ss.str();
-    int size = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, NULL, 0, NULL, NULL);
-    std::string utf8(size, 0);
-    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, utf8.data(), size, NULL, NULL);
-    std::ofstream ofs(ws_to_s(mainScenePath), std::ios::binary);
-    ofs << utf8;
-    Log("Scene saved (bytes written: " + std::to_string((long long)utf8.size()) + ")");
-}
-
-void LoadScene() {
-    Log("Loading scene from: " + ws_to_s(mainScenePath));
+static void ParseScene() {
     entities.clear();
-    std::string raw = readAllBytesNarrow(mainScenePath);
-    if (raw.empty()) {
-        Log("Scene file empty or missing: " + ws_to_s(mainScenePath));
-        return;
-    }
-    Log("Scene file content (first 1024 bytes):\n" + raw.substr(0, 1024));
-    // Very simple parser: find occurrences of "asset" and read numeric x,y,w,h
-    size_t pos = 0;
+    std::wstring scenePath = projectPath + L"\\scenes\\main.scene";
+    std::string content;
+    if (!ReadFileUtf8(scenePath, content)) { AppendLog("main.scene missing or unreadable"); return; }
+    AppendLog("Scene loaded: " + content.substr(0, std::min<size_t>(content.size(),1024)));
+    // Minimal parser (tuned for your simple format)
+    size_t pos=0;
     while (true) {
-        pos = raw.find("\"asset\"", pos);
-        if (pos == std::string::npos) break;
-        size_t q1 = raw.find('\"', raw.find(':', pos) + 1);
-        size_t q2 = raw.find('\"', q1 + 1);
-        if (q1 == std::string::npos || q2 == std::string::npos) break;
-        std::string asset = raw.substr(q1 + 1, q2 - q1 - 1);
-        size_t xPos = raw.find("\"x\"", pos);
-        size_t yPos = raw.find("\"y\"", pos);
-        size_t wPos = raw.find("\"w\"", pos);
-        size_t hPos = raw.find("\"h\"", pos);
-        int x = 0, y = 0, w = 64, h = 64;
-        if (xPos != std::string::npos) x = atoi(raw.c_str() + raw.find(':', xPos) + 1);
-        if (yPos != std::string::npos) y = atoi(raw.c_str() + raw.find(':', yPos) + 1);
-        if (wPos != std::string::npos) w = atoi(raw.c_str() + raw.find(':', wPos) + 1);
-        if (hPos != std::string::npos) h = atoi(raw.c_str() + raw.find(':', hPos) + 1);
-        Entity e;
-        e.assetFilename = s_to_ws(asset);
-        e.id = e.assetFilename;
-        e.x = x; e.y = y; e.w = w; e.h = h; e.layer = 1;
-        entities.push_back(e);
-        pos = (hPos != std::string::npos) ? hPos + 1 : pos + 1;
-    }
-    Log("Loaded entities count: " + std::to_string((long long)entities.size()));
-}
-
-// ------------------------------------------------------------
-// COORDINATE UTILITIES
-// ------------------------------------------------------------
-POINT ScreenToWorld(int sx, int sy) {
-    int sceneLeft = 0;
-    int sceneTop = toolbarH;
-    float wx = (sx - sceneLeft - viewOffsetX) / viewZoom;
-    float wy = (sy - sceneTop - viewOffsetY) / viewZoom;
-    return POINT{ (int)wx, (int)wy };
-}
-
-POINT WorldToScreen(int wx, int wy) {
-    int sceneLeft = 0;
-    int sceneTop = toolbarH;
-    int sx = (int)(wx * viewZoom + viewOffsetX) + sceneLeft;
-    int sy = (int)(wy * viewZoom + viewOffsetY) + sceneTop;
-    return POINT{ sx, sy };
-}
-
-// ------------------------------------------------------------
-// WINDOW PROC
-// ------------------------------------------------------------
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_LBUTTONDOWN: {
-        int mx = GET_X_LPARAM(lParam);
-        int my = GET_Y_LPARAM(lParam);
-        int assetsTop = winH - assetsPanelH;
-        if (my >= assetsTop) {
-            int thumbW = 70;
-            int perRow = std::max(1, (winW - rightPanelW) / thumbW);
-            int tx = mx / thumbW;
-            int ty = (my - assetsTop) / 80;
-            int which = ty * perRow + tx;
-            if (which >= 0 && which < (int)assetFiles.size()) {
-                selectedAssetIndex = which;
-                InvalidateRect(hWnd, NULL, FALSE);
-                return 0;
-            }
-        }
-        if (my > toolbarH && my < winH - assetsPanelH) {
-            POINT wp = ScreenToWorld(mx, my);
-            for (int i = (int)entities.size() - 1; i >= 0; --i) {
-                Entity &e = entities[i];
-                if (wp.x >= e.x && wp.x <= e.x + e.w && wp.y >= e.y && wp.y <= e.y + e.h) {
-                    selectedEntity = i;
-                    InvalidateRect(hWnd, NULL, FALSE);
-                    return 0;
+        size_t b = content.find('{', pos);
+        if (b==std::string::npos) break;
+        size_t e = content.find('}', b);
+        if (e==std::string::npos) break;
+        std::string block = content.substr(b, e-b+1);
+        if (block.find("\"asset\"")!=std::string::npos) {
+            Entity ent;
+            // id
+            size_t p = block.find("\"id\"");
+            if (p!=std::string::npos) {
+                size_t q = block.find('"', p+4);
+                size_t r = block.find('"', q+1);
+                size_t s = block.find('"', r+1);
+                size_t t = block.find('"', s+1);
+                if (s!=std::string::npos && t!=std::string::npos) {
+                    std::string val = block.substr(s+1, t-s-1);
+                    ent.id = val;
                 }
             }
-            if (!assetFiles.empty()) {
-                Entity e;
-                e.x = wp.x; e.y = wp.y;
-                Bitmap* b = assetImages[selectedAssetIndex];
-                e.w = b ? b->GetWidth() : 64;
-                e.h = b ? b->GetHeight() : 64;
-                e.assetFilename = fs::path(assetFiles[selectedAssetIndex]).filename().wstring();
-                e.id = e.assetFilename + std::to_wstring(entities.size() + 1);
-                entities.push_back(e);
-                selectedEntity = (int)entities.size() - 1;
-                InvalidateRect(hWnd, NULL, FALSE);
+            // asset
+            p = block.find("\"asset\"");
+            if (p!=std::string::npos) {
+                size_t q = block.find('"', p+6);
+                size_t r = block.find('"', q+1);
+                size_t s = block.find('"', r+1);
+                size_t t = block.find('"', s+1);
+                if (s!=std::string::npos && t!=std::string::npos) {
+                    std::string val = block.substr(s+1, t-s-1);
+                    ent.asset = Utf8ToW(val);
+                }
             }
+            // x,y,z
+            auto getNum=[&](const std::string &blk, const char key)->int{
+                size_t pp=blk.find(std::string("\"")+std::string(1,key)+std::string("\""));
+                if (pp==std::string::npos) return 0;
+                size_t colon = blk.find(':', pp);
+                if (colon==std::string::npos) return 0;
+                size_t comma = blk.find_first_of(",}", colon+1);
+                std::string s = blk.substr(colon+1, comma-colon-1);
+                try { return std::stoi(s); } catch(...) { return 0; }
+            };
+            ent.x = getNum(block,'x');
+            ent.y = getNum(block,'y');
+            ent.z = getNum(block,'z');
+            entities.push_back(ent);
         }
-        return 0;
+        pos = e+1;
+    }
+    // attach asset pointers
+    for (auto &en: entities) {
+        Asset* a = FindAsset(en.asset);
+        if (a) en.assetPtr = a;
+    }
+    AppendLog("Parsed entities: " + std::to_string(entities.size()));
+}
+
+static void SaveScene() {
+    // simple serializer matching original format
+    std::wstring scenePath = projectPath + L"\\scenes\\main.scene";
+    std::ostringstream ss;
+    ss << "{\n  \"id\":\"main\",\n  \"entities\":[\n";
+    for (size_t i=0;i<entities.size();++i) {
+        auto &e = entities[i];
+        ss << "    { \"id\":\"" << e.id << "\", \"asset\":\"" << WToUtf8(e.asset) << "\", \"x\":" << e.x << ", \"y\":" << e.y << ", \"z\":" << e.z << " }";
+        if (i+1<entities.size()) ss << ",";
+        ss << "\n";
+    }
+    ss << "  ],\n  \"script\":[]\n}\n";
+    std::string out = ss.str();
+    bool ok = WriteFileUtf8(scenePath, out);
+    AppendLog(std::string("Saved scene: ") + (ok? "OK":"FAILED"));
+}
+
+// ----------------- UI helpers -----------------
+
+static void DrawRoundedRect(Graphics &g, REAL x, REAL y, REAL w, REAL h, REAL r, const Gdiplus::Brush &brush) {
+    // approximate rounded rect by filling rectangle and draw corners (simple)
+    g.FillRectangle(&brush, x+r, y, w-2*r, h);
+    g.FillRectangle(&brush, x, y+r, r, h-2*r);
+    g.FillRectangle(&brush, x+w-r, y+r, r, h-2*r);
+    // center fill
+    g.FillRectangle(&brush, x+r, y+r, w-2*r, h-2*r);
+    // corners as filled circles
+    SolidBrush tmpBrush(Color(255,0,0,0));
+    GraphicsPath path;
+    path.AddEllipse(RectF(x, y, 2*r, 2*r));
+    path.AddEllipse(RectF(x+w-2*r, y, 2*r, 2*r));
+    path.AddEllipse(RectF(x, y+h-2*r, 2*r, 2*r));
+    path.AddEllipse(RectF(x+w-2*r, y+h-2*r, 2*r, 2*r));
+    // we can't easily fill path with existing brush reference; use brush by color extraction not ideal.
+    // Simpler: draw circle fills using same brush by creating SolidBrush with sampled color.
+}
+
+// small helper to draw text with nice default font
+static void DrawTextNice(Graphics &g, const std::wstring &text, REAL x, REAL y, REAL size=12.0f) {
+    FontFamily ff(L"Segoe UI");
+    Font font(&ff, size, FontStyleRegular, UnitPixel);
+    SolidBrush col(Color(255,240,240,240));
+    PointF pt(x,y);
+    g.DrawString(text.c_str(), -1, &font, pt, &col);
+}
+
+// ----------------- Painting -----------------
+
+static void PaintAll(HDC hdc) {
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeHighQuality);
+    g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+
+    // background
+    LinearGradientBrush bgBrush(Rect(0,0,winW,winH), Color(255,25,25,30), Color(255,18,24,36), LinearGradientModeVertical);
+    g.FillRectangle(&bgBrush, 0, 0, winW, winH);
+
+    // toolbar
+    RectF toolbarRect(0,0, (REAL)winW, (REAL)toolbarH);
+    SolidBrush toolbarBg(Color(255,18,18,20));
+    g.FillRectangle(&toolbarBg, toolbarRect);
+
+    FontFamily ff(L"Segoe UI");
+    Font fnt(&ff, 16.0f, FontStyleBold, UnitPixel);
+    SolidBrush white(Color(255,230,230,235));
+    PointF titlePt(12.0f, 12.0f);
+    g.DrawString(L"Thunderz Engine - Editor", -1, &fnt, titlePt, &white);
+
+    // toolbar buttons (Save, Play)
+    RectF saveR(220,6,96,32), playR(324,6,96,32);
+    SolidBrush saveBg(Color(255,40,120,70));
+    SolidBrush playBg(Color(255,60,90,160));
+    g.FillRectangle(&saveBg, saveR);
+    g.FillRectangle(&playBg, playR);
+    Font btnF(&ff,12.0f, FontStyleRegular, UnitPixel);
+    SolidBrush btnTxt(Color(255,245,245,245));
+    g.DrawString(L"Save (S)", -1, &btnF, PointF(saveR.X+18, saveR.Y+8), &btnTxt);
+    g.DrawString(L"Play (P)", -1, &btnF, PointF(playR.X+20, playR.Y+8), &btnTxt);
+
+    // left panel (Hierarchy)
+    RectF leftRect(0, toolbarH, (REAL)leftW, (REAL)(winH - toolbarH));
+    SolidBrush panelBg(Color(255,20,20,24));
+    g.FillRectangle(&panelBg, leftRect);
+    // header
+    g.DrawString(L"Hierarchy", -1, &btnF, PointF(12, toolbarH + 8), &white);
+
+    // right panel (Inspector)
+    RectF rightRect((REAL)(winW-rightW), (REAL)toolbarH, (REAL)rightW, (REAL)(winH - toolbarH));
+    SolidBrush rightBg(Color(255,18,18,22));
+    g.FillRectangle(&rightBg, rightRect);
+    g.DrawString(L"Inspector", -1, &btnF, PointF((REAL)(winW-rightW)+12, toolbarH+8), &white);
+
+    // bottom-left assets area
+    RectF assetsRect(0, (REAL)(winH-assetsH), (REAL)leftW, (REAL)assetsH);
+    SolidBrush assetsBg(Color(255,14,14,18));
+    g.FillRectangle(&assetsBg, assetsRect);
+    g.DrawString(L"Assets", -1, &btnF, PointF(12, (REAL)(winH-assetsH)+8), &white);
+
+    // scene view rect
+    RectF sceneRect((REAL)leftW, (REAL)toolbarH, (REAL)(winW-leftW-rightW), (REAL)(winH-toolbarH-assetsH));
+    SolidBrush sceneBg(Color(255,30,30,36));
+    g.FillRectangle(&sceneBg, sceneRect);
+
+    // draw entities in scene
+    // sort by z
+    std::vector<int> order;
+    for (size_t i=0;i<entities.size();++i) order.push_back((int)i);
+    std::sort(order.begin(), order.end(), [&](int a, int b){
+        return entities[a].z < entities[b].z;
+    });
+
+    for (int idx: order) {
+        Entity &en = entities[idx];
+        if (en.assetPtr && en.assetPtr->bmp) {
+            Bitmap *bmp = en.assetPtr->bmp;
+            REAL dx = (REAL)leftW + en.x;
+            REAL dy = (REAL)toolbarH + en.y;
+            g.DrawImage(bmp, dx, dy, (REAL)en.assetPtr->w, (REAL)en.assetPtr->h);
+        } else {
+            // placeholder
+            SolidBrush ph(Color(255,180,60,60));
+            g.FillRectangle(&ph, (REAL)leftW + en.x, (REAL)toolbarH + en.y, 48, 48);
+            Font small(&ff,10, FontStyleRegular, UnitPixel);
+            g.DrawString(Utf8ToW(en.id).c_str(), -1, &small, PointF(leftW + en.x + 2, toolbarH + en.y + 2), &white);
+        }
     }
 
-    case WM_MOUSEWHEEL: {
-        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        if (delta > 0) viewZoom *= 1.1f; else viewZoom /= 1.1f;
-        if (viewZoom < 0.1f) viewZoom = 0.1f;
-        if (viewZoom > 4.0f) viewZoom = 4.0f;
-        InvalidateRect(hWnd, NULL, FALSE);
-        return 0;
+    // highlight selected entity with outline
+    if (selectedEntity >=0 && selectedEntity < (int)entities.size()) {
+        Entity &s = entities[selectedEntity];
+        Pen selPen(Color(255,180,220,255), 2.0f);
+        RealRectF rect((REAL)leftW + s.x - 3, (REAL)toolbarH + s.y - 3,
+                       (s.assetPtr? (REAL)s.assetPtr->w + 6 : 54.0f),
+                       (s.assetPtr? (REAL)s.assetPtr->h + 6 : 54.0f));
+        g.DrawRectangle(&selPen, rect.X, rect.Y, rect.Width, rect.Height);
     }
 
+    // draw hierarchy list
+    Font hfont(&ff, 12.0f, FontStyleRegular, UnitPixel);
+    int y = toolbarH + 36;
+    for (size_t i=0;i<entities.size();++i) {
+        Entity &e = entities[i];
+        RectF item((REAL)8, (REAL)y, (REAL)leftW - 16, 24.0f);
+        SolidBrush itemBg((i==selectedEntity)? Color(255,40,40,60) : Color(255,18,18,22));
+        g.FillRectangle(&itemBg, item);
+        g.DrawString(Utf8ToW(e.id).c_str(), -1, &hfont, PointF(12, (REAL)y+4), &white);
+        y += 28;
+    }
+
+    // draw assets thumbnails (grid)
+    int ax = 8, ay = winH - assetsH + 36;
+    int thumb = 64;
+    int gap = 8;
+    int count=0;
+    for (auto &a: assets) {
+        if (a.bmp) {
+            REAL px = (REAL)ax + (count%2)*(thumb+gap);
+            REAL py = (REAL)ay + (count/2)*(thumb+gap);
+            g.DrawImage(a.bmp, px, py, (REAL)thumb, (REAL)thumb);
+            // name
+            Font aname(&ff, 9.0f, FontStyleRegular, UnitPixel);
+            g.DrawString(a.name.c_str(), -1, &aname, PointF(px, py+thumb+2), &white);
+            count++;
+        } else {
+            // placeholder
+            SolidBrush pb(Color(255,40,40,40));
+            g.FillRectangle(&pb, ax + (count%2)*(thumb+gap), ay + (count/2)*(thumb+gap), thumb, thumb);
+            count++;
+        }
+    }
+
+    // inspector content (if selected)
+    if (selectedEntity>=0 && selectedEntity < (int)entities.size()) {
+        Entity &si = entities[selectedEntity];
+        int insX = winW - rightW + 12;
+        int insY = toolbarH + 36;
+        Font lab(&ff, 11.0f, FontStyleRegular, UnitPixel);
+        g.DrawString(L"ID:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
+        g.DrawString(Utf8ToW(si.id).c_str(), -1, &lab, PointF((REAL)insX+40, (REAL)insY), &white);
+        insY += 28;
+        g.DrawString(L"Asset:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
+        std::wstring an = si.asset.empty()? L"(none)": si.asset;
+        g.DrawString(an.c_str(), -1, &lab, PointF((REAL)insX+60, (REAL)insY), &white);
+        insY += 28;
+        g.DrawString(L"X:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
+        g.DrawString(std::to_wstring(si.x).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
+        insY += 22;
+        g.DrawString(L"Y:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
+        g.DrawString(std::to_wstring(si.y).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
+        insY += 22;
+        g.DrawString(L"Z:", -1, &lab, PointF((REAL)insX, (REAL)insY), &white);
+        g.DrawString(std::to_wstring(si.z).c_str(), -1, &lab, PointF((REAL)insX+20, (REAL)insY), &white);
+        insY += 32;
+        // Small Save hint
+        Font small(&ff, 10.0f, FontStyleRegular, UnitPixel);
+        g.DrawString(L"Edit values by typing into console (TODO: GUI fields)", -1, &small, PointF((REAL)insX, (REAL)insY), &white);
+    } else {
+        Font lab(&ff, 11.0f, FontStyleRegular, UnitPixel);
+        g.DrawString(L"No selection", -1, &lab, PointF((REAL)(winW-rightW)+12, (REAL)toolbarH+36), &white);
+    }
+}
+
+// ----------------- Mouse handling -----------------
+
+static bool PointInRect(int px, int py, int rx, int ry, int rw, int rh) {
+    return (px>=rx && px<=rx+rw && py>=ry && py<=ry+rh);
+}
+
+static void OnLButtonDown(int mx, int my) {
+    // check toolbar Save/Play
+    if (my >= 6 && my <= 6+32 && mx >= 220 && mx <= 220+96) {
+        SaveScene();
+        AppendLog("User clicked Save");
+        InvalidateRect(hwndGlobal, NULL, TRUE);
+        return;
+    }
+    // compute scene area origin
+    int sceneX = leftW;
+    int sceneY = toolbarH;
+    int sceneW = winW - leftW - rightW;
+    int sceneH = winH - toolbarH - assetsH;
+    // click inside scene?
+    if (PointInRect(mx,my, sceneX, sceneY, sceneW, sceneH)) {
+        // translate
+        int sx = mx - sceneX;
+        int sy = my - sceneY;
+        // find topmost entity under click (reverse z)
+        int hit = -1;
+        for (int i = (int)entities.size()-1; i>=0; --i) {
+            Entity &e = entities[i];
+            int ex = e.x, ey = e.y;
+            int ew = (e.assetPtr? (int)e.assetPtr->w : 48);
+            int eh = (e.assetPtr? (int)e.assetPtr->h : 48);
+            if (sx >= ex && sx <= ex+ew && sy >= ey && sy <= ey+eh) { hit = i; break; }
+        }
+        if (hit!=-1) {
+            selectedEntity = hit;
+            AppendLog("Selected entity (scene click): " + entities[hit].id);
+            InvalidateRect(hwndGlobal, NULL, TRUE);
+            return;
+        } else {
+            selectedEntity = -1;
+            InvalidateRect(hwndGlobal, NULL, TRUE);
+            return;
+        }
+    }
+    // click in hierarchy (left)
+    int hy = toolbarH + 36;
+    for (size_t i=0;i<entities.size();++i) {
+        int itemY = hy + (int)i * 28;
+        if (PointInRect(mx,my, 8, itemY, leftW-16, 24)) {
+            selectedEntity = (int)i;
+            AppendLog("Selected entity (hierarchy): " + entities[i].id);
+            InvalidateRect(hwndGlobal, NULL, TRUE);
+            return;
+        }
+    }
+    // click in assets area - add new entity at (10,10)
+    int ax = 8, ay = winH - assetsH + 36;
+    int thumb = 64, gap=8;
+    int col = (mx - ax) / (thumb + gap);
+    if (mx >= ax && my >= ay) {
+        int index = (my - ay) / (thumb + gap) * 2 + col;
+        if (index >=0 && index < (int)assets.size()) {
+            // create new entity
+            Entity ne;
+            ne.id = "entity_" + std::to_string(entities.size()+1);
+            ne.asset = assets[index].name;
+            ne.x = 20; ne.y = 20; ne.z = 0;
+            ne.assetPtr = &assets[index];
+            entities.push_back(ne);
+            selectedEntity = (int)entities.size()-1;
+            AppendLog("Created entity from asset: " + WToUtf8(ne.asset));
+            InvalidateRect(hwndGlobal, NULL, TRUE);
+            return;
+        }
+    }
+}
+
+// ----------------- WinProc -----------------
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE:
+        return 0;
+    case WM_SIZE:
+        winW = LOWORD(lParam); winH = HIWORD(lParam);
+        InvalidateRect(hWnd, NULL, TRUE);
+        return 0;
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
-        Graphics g(hdc);
-        g.SetSmoothingMode(SmoothingModeHighQuality);
-        g.Clear(Color(40, 40, 45));
-
-        SolidBrush sb(Color(60, 60, 70));
-        g.FillRectangle(&sb, 0, toolbarH, winW - rightPanelW, winH - toolbarH - assetsPanelH);
-
-        Pen pen(Color(70, 70, 80));
-        for (int x = -2000; x < 4000; x += 40) {
-            POINT p1 = WorldToScreen(x, -2000);
-            POINT p2 = WorldToScreen(x, 4000);
-            g.DrawLine(&pen, (INT)p1.x, (INT)p1.y, (INT)p2.x, (INT)p2.y);
-        }
-        for (int y = -2000; y < 4000; y += 40) {
-            POINT p1 = WorldToScreen(-2000, y);
-            POINT p2 = WorldToScreen(4000, y);
-            g.DrawLine(&pen, (INT)p1.x, (INT)p1.y, (INT)p2.x, (INT)p2.y);
-        }
-
-        for (auto& e : entities) {
-            POINT tl = WorldToScreen(e.x, e.y);
-            Rect r(tl.x, tl.y, (INT)(e.w * viewZoom), (INT)(e.h * viewZoom));
-            Bitmap* b = nullptr;
-            for (size_t i = 0; i < assetFiles.size(); i++) {
-                if (fs::path(assetFiles[i]).filename().wstring() == e.assetFilename)
-                    b = assetImages[i];
-            }
-            if (b) g.DrawImage(b, r);
-            else { SolidBrush red(Color(200, 80, 60)); g.FillRectangle(&red, r); }
-        }
-
-        SolidBrush ab(Color(22, 22, 22));
-        g.FillRectangle(&ab, 0, winH - assetsPanelH, winW - rightPanelW, assetsPanelH);
-        int x = 10;
-        for (size_t i = 0; i < assetImages.size(); i++) {
-            Bitmap* b = assetImages[i];
-            if (b) {
-                g.DrawImage(b, x, winH - assetsPanelH + 10, 64, 64);
-            }
-            x += 70;
-        }
-
-        SolidBrush rp(Color(30, 30, 30));
-        g.FillRectangle(&rp, winW - rightPanelW, 0, rightPanelW, winH);
-
-        FontFamily ff(L"Segoe UI");
-        Font font(&ff, 12);
-        SolidBrush white(Color(235, 235, 235));
-
-        g.DrawString(L"Inspector", -1, &font, PointF((REAL)(winW - rightPanelW + 10), 10), &white);
-
-        if (selectedEntity >= 0 && selectedEntity < (int)entities.size()) {
-            Entity& e = entities[selectedEntity];
-            int baseY = 40;
-            g.DrawString(e.assetFilename.c_str(), -1, &font, PointF((REAL)(winW - rightPanelW + 10), (REAL)baseY), &white);
-            baseY += 20;
-            std::wstring pos = L"Pos: " + std::to_wstring(e.x) + L"," + std::to_wstring(e.y);
-            g.DrawString(pos.c_str(), -1, &font, PointF((REAL)(winW - rightPanelW + 10), (REAL)baseY), &white);
-        }
-
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        PaintAll(hdc);
         EndPaint(hWnd, &ps);
         return 0;
     }
-
+    case WM_LBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lParam);
+        int my = GET_Y_LPARAM(lParam);
+        OnLButtonDown(mx, my);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        if (wParam == 'S') { SaveScene(); AppendLog("Saved via S"); InvalidateRect(hWnd, NULL, TRUE); }
+        if (wParam == 'P') {
+            // launch runtime next to EXE if exists
+            std::wstring rt = exeFolder + L"\\ThunderzRuntime.exe";
+            STARTUPINFOW si = {}; si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+            std::wstring cmd = L"\"" + rt + L"\" \"" + projectPath + L"\"";
+            if (CreateProcessW(rt.c_str(), (LPWSTR)cmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                AppendLog("Launched runtime: " + WToUtf8(rt));
+            } else {
+                AppendLog("Failed to launch runtime: " + WToUtf8(rt));
+            }
+        }
+        return 0;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    default:
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-// ------------------------------------------------------------
-// WINMAIN
-// ------------------------------------------------------------
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
-    // open log
-    gLog.open("editor.log", std::ios::out | std::ios::trunc);
-    if (!gLog.is_open()) return -1;
-    Log("--- Thunderz Editor (debug) startup ---");
+// ----------------- Init & main -----------------
 
-    // find exe folder
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    fs::path p(path);
-    exeFolder = p.parent_path().wstring();
-    Log("EXE folder: " + ws_to_s(exeFolder));
-
-    // config path
-    configPath = exeFolder + L"\\config.txt";
-    Log("Config path: " + ws_to_s(configPath));
-
-    // read config.txt
-    std::wstring cfgLine;
-    if (fs::exists(configPath)) {
-        std::ifstream cfg(ws_to_s(configPath));
-        std::string tmp;
-        std::getline(cfg, tmp);
-        cfgLine = s_to_ws(tmp);
-        Log("Read config line: " + tmp);
-    } else {
-        Log("config.txt not found at expected location. Will try default project path.");
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    // clear & init log
+    {
+        std::ofstream f("editor.log", std::ios::trunc);
+        f << CurrentTimestamp() << " - --- Thunderz Editor (debug) startup ---\n";
     }
 
-    // parse config line
-    if (!cfgLine.empty()) {
-        // accept forms: project=..., project_path=..., path=...
-        std::string narrow = ws_to_s(cfgLine);
-        std::transform(narrow.begin(), narrow.end(), narrow.begin(), ::tolower);
-        size_t pos = narrow.find("project_path=");
-        if (pos != std::string::npos) {
-            // extract from wide string using the same index
-            std::wstring val_w = cfgLine.substr((int)pos + 13); // after project_path=
-            // trim CR/LF from wide string
-            while (!val_w.empty() && (val_w.back() == L'\r' || val_w.back() == L'\n')) val_w.pop_back();
-            std::string val = ws_to_s(val_w);
-            // detect absolute path by checking for drive letter or starting slash
-            bool isAbs = (val.find(':') != std::string::npos) || (!val.empty() && (val[0] == '\\' || val[0] == '/'));
-            if (isAbs) projectPath = val_w;
-            else projectPath = exeFolder + L"\\" + val_w;
-        } else {
-            // try simpler key
-            pos = narrow.find("project=");
-            if (pos != std::string::npos) {
-                std::wstring val_w = cfgLine.substr((int)pos + 8);
-                while (!val_w.empty() && (val_w.back() == L'\r' || val_w.back() == L'\n')) val_w.pop_back();
-                std::string val = ws_to_s(val_w);
-                bool isAbs = (val.find(':') != std::string::npos) || (!val.empty() && (val[0] == '\\' || val[0] == '/'));
-                if (isAbs) projectPath = val_w;
-                else projectPath = exeFolder + L"\\" + val_w;
+    exeFolder = GetExeFolder();
+    AppendLog("EXE folder: " + WToUtf8(exeFolder));
+    // read config.txt
+    std::wstring cfg = exeFolder + L"\\config.txt";
+    std::string content;
+    if (ReadFileUtf8(cfg, content)) {
+        AppendLog("Read config: " + content.substr(0, std::min<size_t>(content.size(), 1024)));
+        // parse project_path line
+        std::istringstream iss(content);
+        std::string line;
+        while (std::getline(iss,line)) {
+            if (line.rfind("project_path=",0)==0) {
+                std::string val = line.substr(strlen("project_path="));
+                projectPath = Utf8ToW(val);
+                AppendLog("Resolved project path: " + WToUtf8(projectPath));
+                break;
             }
         }
-    }
-
-    // if still empty, fallback to default relative project
-    if (projectPath.empty()) {
-        projectPath = exeFolder + L"\\" + defaultRelProject;
-        Log("Using fallback project path: " + ws_to_s(projectPath));
     } else {
-        Log("Resolved project path: " + ws_to_s(projectPath));
+        AppendLog("config.txt missing next to exe. Using exeFolder as project path.");
+        projectPath = exeFolder;
     }
 
-    // set assets/scenes paths
-    assetsDir = projectPath + L"\\assets";
-    scenesDir = projectPath + L"\\scenes";
-    mainScenePath = scenesDir + L"\\main.scene";
-
-    // Create missing dirs automatically (debug mode)
-    try {
-        if (!fs::exists(projectPath)) { fs::create_directories(projectPath); Log("Created project folder: " + ws_to_s(projectPath)); }
-        if (!fs::exists(assetsDir)) { fs::create_directories(assetsDir); Log("Created assets folder: " + ws_to_s(assetsDir)); }
-        if (!fs::exists(scenesDir)) { fs::create_directories(scenesDir); Log("Created scenes folder: " + ws_to_s(scenesDir)); }
-    } catch (std::exception &e) {
-        Log(std::string("Exception creating folders: ") + e.what());
-    }
-
-    // list files in project
-    try {
-        Log("Project contents:");
-        for (auto &it : fs::directory_iterator(projectPath)) {
-            Log(" - " + ws_to_s(it.path().filename().wstring()));
-        }
-    } catch (...) {}
-
-    // -------------------------
-    // IMPORTANT CHANGE: Initialize GDI+ BEFORE loading bitmaps
-    // -------------------------
+    // init GDI+
     GdiplusStartupInput gsi;
-    if (GdiplusStartup(&gToken, &gsi, NULL) != Ok) {
-        Log("GdiplusStartup failed");
-        return -1;
+    if (GdiplusStartup(&gdiToken, &gsi, NULL) != Ok) {
+        MessageBoxW(NULL, L"Gdiplus failed to initialize", L"Error", MB_ICONERROR);
+        return 1;
     }
-    Log("Gdiplus initialized successfully");
+    gdiInited = true;
+    AppendLog("GDI+ initialized");
 
-    // scan assets and load scene (now GDI+ is ready so Bitmap::FromFile will work)
-    ScanAssets();
-    LoadScene();
+    // scan/load project
+    ScanAssetsFolder();
+    LoadBitmaps();
+    ParseScene();
 
-    // register window
-    WNDCLASS wc = {};
+    // register windows class
+    const wchar_t CLASS_NAME[] = L"ThunderzEditorClass";
+    WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"ThunderzEditor";
-    RegisterClass(&wc);
+    wc.lpszClassName = CLASS_NAME;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassW(&wc);
 
-    HWND wnd = CreateWindowEx(0, wc.lpszClassName, L"Thunderz Editor (debug)", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL, NULL, hInstance, NULL);
-    ShowWindow(wnd, nCmdShow);
+    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"Thunderz Editor", WS_OVERLAPPEDWINDOW,
+                                CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL, NULL, hInstance, NULL);
+    if (!hwnd) { AppendLog("CreateWindowExW failed"); return 1; }
+    hwndGlobal = hwnd;
 
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    // main loop
     MSG msg;
-    Log("Entering main loop");
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
-    Log("Shutting down, cleaning up");
-    for (auto b : assetImages) if (b) delete b;
-    GdiplusShutdown(gToken);
-    gLog.close();
+    // cleanup
+    for (auto &a: assets) if (a.bmp) { delete a.bmp; a.bmp=nullptr; }
+    if (gdiInited) GdiplusShutdown(gdiToken);
+
+    AppendLog("Editor exiting");
     return 0;
 }
-
