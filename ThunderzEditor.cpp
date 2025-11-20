@@ -154,7 +154,7 @@ void SaveSceneToFile(const std::string &scenePath) {
     }
     ss << "  ],\n  \"script\": []\n}\n";
     bool ok = WriteFileText(scenePath, ss.str());
-    AppendLog(string("Saved scene: ") + (ok?"OK":"FAILED") );
+    AppendLog(std::string("Saved scene: ") + (ok?"OK":"FAILED") );
 }
 
 // ------------------------------- Asset scanning & loading -------------------------------
@@ -550,4 +550,5 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     AppendLog("Editor exiting");
     return 0;
 }
+
 
